@@ -31,6 +31,16 @@ DEFAULT_IMAGE_WIDTH = 640
 DEFAULT_IMAGE_HEIGHT = 480
 # Common source resolutions: 480x640 (RoboDojo) and 240x320 (RoboTwin).
 SUPPORTED_IMAGE_SIZES = ((480, 640), (240, 320))
+UMI_ACTION_DIM_PER_ARM = 7
+UMI_ACTION_COMPONENTS = (
+    "delta_x",
+    "delta_y",
+    "delta_z",
+    "delta_rotvec_x",
+    "delta_rotvec_y",
+    "delta_rotvec_z",
+    "gripper",
+)
 
 
 
@@ -183,6 +193,24 @@ def _build_motor_names_from_dims(per_arm_dims):
     return motors
 
 
+def _build_umi_action_names(num_arms):
+    if num_arms <= 0:
+        raise ValueError("num_arms must be positive")
+
+    if num_arms == 1:
+        prefixes = ["arm"]
+    elif num_arms == 2:
+        prefixes = ["left", "right"]
+    else:
+        prefixes = [f"arm_{index}" for index in range(num_arms)]
+
+    return [
+        f"{prefix}_{component}"
+        for prefix in prefixes
+        for component in UMI_ACTION_COMPONENTS
+    ]
+
+
 def _expected_state_dim(robot_action_dim_info):
     return sum(robot_action_dim_info.get("arm_dim", [])) + sum(robot_action_dim_info.get("ee_dim", []))
 
@@ -230,11 +258,15 @@ def create_empty_dataset(
     fps: int,
     mode: Literal["video", "image"] = "video",
     *,
+    action_motors: list[str] | None = None,
     image_height: int = DEFAULT_IMAGE_HEIGHT,
     image_width: int = DEFAULT_IMAGE_WIDTH,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
     
 ) -> LeRobotDataset:
+    if action_motors is None:
+        action_motors = motors
+
     features = {
         "observation.state": {
             "dtype": "float32",
@@ -245,9 +277,9 @@ def create_empty_dataset(
         },
         "action": {
             "dtype": "float32",
-            "shape": (len(motors),),
+            "shape": (len(action_motors),),
             "names": [
-                motors,
+                action_motors,
             ],
         },
     }
@@ -460,7 +492,25 @@ def _extract_qpos(data):
     raise ValueError("Cannot find qpos data")
 
 
-def _extract_action(data):
+def _extract_action(data, action_type="joint"):
+    if action_type == "umi":
+        action = _concat_state_parts(
+            [
+                ("left_umi_relative_actions", _get_nested(data, "action", "left_umi_relative_actions")),
+                ("right_umi_relative_actions", _get_nested(data, "action", "right_umi_relative_actions")),
+            ],
+            "action",
+        )
+        if action is not None:
+            return action
+        raise ValueError(
+            "Cannot find UMI relative action data. Expected "
+            "action.left_umi_relative_actions and/or action.right_umi_relative_actions"
+        )
+
+    if action_type != "joint":
+        raise ValueError(f"Unsupported action_type: {action_type}")
+
     action = _concat_state_parts(
         [
             ("left_arm_joint_states", _get_nested(data, "action", "left_arm_joint_states")),
@@ -509,15 +559,21 @@ def convert_one(
     target_dims,
     image_height,
     image_width,
+    action_type,
 ):
     data = load(str(input_path), data_type=data_type, data_version=data_version)
 
     state = _extract_qpos(data)
-    action = _extract_action(data)
-    if state.shape != action.shape:
-        raise ValueError(f"state/action shape mismatch: {state.shape} vs {action.shape}")
+    action = _extract_action(data, action_type=action_type)
+    if state.shape[0] != action.shape[0]:
+        raise ValueError(f"state/action horizon mismatch: {state.shape[0]} vs {action.shape[0]}")
     state = _pad_state_to_target_dims(state, current_dims, target_dims, "state")
-    action = _pad_state_to_target_dims(action, current_dims, target_dims, "action")
+    if action_type == "umi":
+        umi_current_dims = [UMI_ACTION_DIM_PER_ARM] * len(current_dims)
+        umi_target_dims = [UMI_ACTION_DIM_PER_ARM] * len(target_dims)
+        action = _pad_state_to_target_dims(action, umi_current_dims, umi_target_dims, "action")
+    else:
+        action = _pad_state_to_target_dims(action, current_dims, target_dims, "action")
     instruction = _choose_instruction(data)
     if not instruction:
         raise ValueError("No instruction found in data")
@@ -589,6 +645,18 @@ def main():
     parser.add_argument("--repo_id", type=str, default=None, help="LeRobot repo_id. Defaults to unified_<dataset> patterns summary")
     parser.add_argument("--data_type", type=str, default=DEFAULT_DATASET_NAME, help="Dataset type, e.g. RoboDojo")
     parser.add_argument("--data_version", type=str, default="v1.0", help="Dataset version, e.g. v1.0")
+    parser.add_argument(
+        "--action_type",
+        choices=("joint", "umi"),
+        default="joint",
+        help="Action written to LeRobot: joint/gripper targets or UMI local SE(3)+gripper actions.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=None,
+        help="Override dataset FPS. Use the source HDF5 collection frequency when it differs from env_cfg.",
+    )
     parser.add_argument("--max_episode", type=int, default=200, help="Max episodes per task/env")
     parser.add_argument(
         "--resolution",
@@ -610,6 +678,8 @@ def main():
         help="Override target image width (use with --image_height).",
     )
     args = parser.parse_args()
+    if args.fps is not None and args.fps <= 0:
+        parser.error("--fps must be positive")
 
     targets = _discover_conversion_targets(args.patterns)
     if not targets:
@@ -622,12 +692,16 @@ def main():
     print(f"Image size: {image_height}x{image_width}")
     repo_id = args.repo_id or f"unified_{'_'.join(pattern.replace('*', 'all').replace('.', '_') for pattern in args.patterns)}".lower()
     motors = _build_motor_names_from_dims(target_dims)
+    action_motors = motors if args.action_type == "joint" else _build_umi_action_names(len(target_dims))
+    fps = args.fps or max_fps or 50
+    print(f"Action type: {args.action_type}; FPS: {fps}")
     
     dataset = create_empty_dataset(
                 repo_id,
                 robot_type="unified_robot",
                 motors=motors,
-                fps=max_fps or 50,
+                action_motors=action_motors,
+                fps=fps,
                 mode="video",
                 image_height=image_height,
                 image_width=image_width,
@@ -646,14 +720,13 @@ def main():
 
         current_dims = metadata_by_target[(bench_name, task_name, env_cfg_type)]["per_arm_dims"]
         for input_path in tqdm(input_files, desc=f"Converting {bench_name}/{task_name}/{env_cfg_type}"):
-            total_files += 1
-
             if task_success >= args.max_episode:
                 print(
                     f"Reached max_episode={args.max_episode} "
                     f"for {bench_name}/{task_name}/{env_cfg_type}"
                 )
                 break
+            total_files += 1
             try:
                 convert_one(
                     input_path,
@@ -664,6 +737,7 @@ def main():
                     target_dims,
                     image_height,
                     image_width,
+                    args.action_type,
                 )
                 task_success += 1
                 total_success += 1
