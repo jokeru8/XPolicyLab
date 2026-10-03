@@ -1,10 +1,34 @@
 import dataclasses
+import types
 
 import jax
+import numpy as np
+import pytest
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+
+
+def test_full_action_horizon_indices_do_not_cross_episodes():
+    dataset = types.SimpleNamespace(
+        episode_data_index={
+            "from": np.asarray([0, 3]),
+            "to": np.asarray([3, 5]),
+        }
+    )
+    assert _data_loader._full_action_horizon_indices(dataset, 2) == [0, 1, 3]  # noqa: SLF001
+
+
+def test_full_action_horizon_requires_a_long_enough_episode():
+    dataset = types.SimpleNamespace(
+        episode_data_index={
+            "from": np.asarray([0]),
+            "to": np.asarray([1]),
+        }
+    )
+    with pytest.raises(ValueError, match="No episode"):
+        _data_loader._full_action_horizon_indices(dataset, 2)  # noqa: SLF001
 
 
 def test_torch_data_loader():

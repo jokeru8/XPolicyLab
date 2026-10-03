@@ -23,7 +23,17 @@ CLIENT_SCRIPT="${SCRIPT_DIR}/setup_eval_env_client.sh"
 policy_server_port=$(bash "${UTILS_DIR}/get_free_port.sh")
 policy_server_ip="localhost"
 
-additional_info="ckpt_name=${ckpt_name},action_type=${action_type}"
+case "${action_type}" in
+  umi|umi_relative|relative_ee)
+    use_head_camera=$(awk '$1 == "use_head_camera:" {print $2}' "${SCRIPT_DIR}/deploy.yml")
+    use_head_camera=${use_head_camera:-false}
+    ;;
+  *)
+    # Legacy joint/EE checkpoints always use all three camera streams.
+    use_head_camera=true
+    ;;
+esac
+additional_info="ckpt_name=${ckpt_name},action_type=${action_type},use_head_camera=${use_head_camera}"
 
 cleanup() {
     if [[ -n "${SERVER_PID:-}" ]]; then

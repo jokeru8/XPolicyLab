@@ -13,10 +13,15 @@ result_dir: "./results/pi05/"
 obs_transform_pipeline: "xspark-v1.0"
 
 # Model / action configuration
-action_type: joint
+action_type: umi
+action_protocol: umi_v1
+use_head_camera: false
+observation_steps: 1
+action_horizon: 50
+execute_steps: 50
 policy_uv_env_path: openpi
 # Must match the config used by train.sh (default OPENPI_TRAIN_CONFIG_NAME).
-train_config_name: pi05_base_aloha_full_sim_arx-x5_seed_0
-repo_id: arx_x5_sim
+train_config_name: pi05_robotwin_umi
+repo_id: robotwin_umi
 
 port: 6000

@@ -14,11 +14,15 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 cd "${OPENPI_ROOT}"
-UV_LINK_MODE=copy GIT_LFS_SKIP_SMUDGE=1 uv sync --group lerobot
-UV_LINK_MODE=copy GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+sync_args=(--group lerobot)
+if [[ -n "${OPENPI_PYTHON:-}" ]]; then
+  sync_args+=(--python "${OPENPI_PYTHON}")
+fi
+UV_LINK_MODE=copy GIT_LFS_SKIP_SMUDGE=1 uv sync "${sync_args[@]}"
+UV_LINK_MODE=copy GIT_LFS_SKIP_SMUDGE=1 uv pip install --python "${OPENPI_ROOT}/.venv/bin/python" -e .
 
-uv pip install -e "${XPOLICYLAB_ROOT}"
-uv run python -c "import XPolicyLab; print('XPolicyLab ok')"
+UV_LINK_MODE=copy uv pip install --python "${OPENPI_ROOT}/.venv/bin/python" -e "${XPOLICYLAB_ROOT}"
+"${OPENPI_ROOT}/.venv/bin/python" -c "import XPolicyLab; print('XPolicyLab ok')"
 
 echo "[Pi_05] Installation finished."
 echo "[Pi_05] Activate: source ${OPENPI_ROOT}/.venv/bin/activate"

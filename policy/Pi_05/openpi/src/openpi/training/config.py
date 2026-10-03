@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -20,6 +21,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.robotwin_umi_policy as robotwin_umi_policy
 import openpi.policies.wuji_policy as wuji_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -34,6 +36,26 @@ import openpi.transforms as _transforms
 _ROBODOJO_ASSETS_DIR = pathlib.Path(__file__).resolve().parents[3] / "assets" / "RoboDojo_assets"
 # Norm stats for Tianji Marvin + Wuji Hand (written by compute_norm_stats).
 _WUJI_ASSETS_DIR = pathlib.Path(__file__).resolve().parents[3] / "assets" / "Wuji_assets"
+
+
+def _robotwin_umi_dataset_root() -> str | None:
+    value = os.environ.get("ROBOTWIN_UMI_DATASET")
+    return value or None
+
+
+def _robotwin_umi_use_head_camera() -> bool:
+    value = os.environ.get("OPENPI_USE_HEAD_CAMERA", "false").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"OPENPI_USE_HEAD_CAMERA must be a boolean, got {value!r}")
+
+
+def _robotwin_umi_repo_id() -> str:
+    value = os.environ.get("OPENPI_LEROBOT_REPO_ID")
+    return value or "robotwin_umi"
+
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -71,6 +93,9 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional local dataset root.  This is required for a prepared dataset
+    # that is not installed under the default LeRobot home directory.
+    dataset_root: str | None = None
     # Video decoder backend for LeRobot datasets. Forced to pyav by default because
     # torchcodec is present in some environments but not fully functional at runtime.
     video_backend: Literal["pyav", "torchcodec", "video_reader"] = "pyav"
@@ -95,6 +120,22 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+
+    # Restrict video decoding to these full LeRobot feature keys.  None keeps
+    # every camera advertised by the dataset.
+    camera_keys: Sequence[str] | None = None
+
+    # Exclude anchor frames whose requested action sequence crosses an episode
+    # boundary.  OpenPI does not currently expose a temporal padding loss mask.
+    require_full_action_horizon: bool = False
+
+    # Optional serializable protocol contract copied into every checkpoint.
+    protocol_metadata: dict[str, Any] | None = None
+
+    # Optional lightweight transform/camera selection used only by
+    # compute_norm_stats. None falls back to the normal training pipeline.
+    norm_stats_transforms: _transforms.Group | None = None
+    norm_stats_camera_keys: Sequence[str] | None = None
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -176,6 +217,7 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    dataset_root: str | None = None
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -191,6 +233,7 @@ class DataConfigFactory(abc.ABC):
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            dataset_root=self.dataset_root,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -284,6 +327,90 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRobotwinUmiDataConfig(DataConfigFactory):
+    """RoboTwin-UMI data semantics for π0.5.
+
+    The source ``action`` stores adjacent-frame local SE(3) increments.  The
+    policy transform composes them into targets relative to the prediction
+    anchor before normalization.
+    """
+
+    use_head_camera: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        image_mapping = {
+            "cam_left_wrist": "observation.images.cam_left_wrist",
+            "cam_right_wrist": "observation.images.cam_right_wrist",
+        }
+        camera_keys = [
+            "observation.images.cam_left_wrist",
+            "observation.images.cam_right_wrist",
+        ]
+        if self.use_head_camera:
+            image_mapping = {"cam_high": "observation.images.cam_high", **image_mapping}
+            camera_keys.insert(0, "observation.images.cam_high")
+
+        repack_transforms = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": image_mapping,
+                        "state": "observation.state",
+                        "actions": "action",
+                        "action_is_pad": "action_is_pad",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[robotwin_umi_policy.RobotwinUmiInputs(use_head_camera=self.use_head_camera)],
+            outputs=[robotwin_umi_policy.RobotwinUmiOutputs()],
+        )
+        norm_stats_transforms = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "state": "observation.state",
+                        "actions": "action",
+                        "action_is_pad": "action_is_pad",
+                    }
+                ),
+                robotwin_umi_policy.RobotwinUmiNormInputs(),
+            ]
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+            camera_keys=tuple(camera_keys),
+            require_full_action_horizon=True,
+            norm_stats_transforms=norm_stats_transforms,
+            norm_stats_camera_keys=(),
+            protocol_metadata={
+                "protocol": "umi_v1",
+                "storage_action_representation": "umi_relative_se3_gripper_v1",
+                "model_action_representation": "umi_chunk_relative_se3_gripper_v1",
+                "state_representation": "joint_gripper",
+                "use_head_camera": self.use_head_camera,
+                "camera_roles": (
+                    ["head", "left_wrist", "right_wrist"]
+                    if self.use_head_camera
+                    else ["left_wrist", "right_wrist"]
+                ),
+                "action_dim": 14,
+                "action_horizon": model_config.action_horizon,
+                "first_target_offset": 1,
+            },
         )
 
 
@@ -632,6 +759,28 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_robotwin_umi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotRobotwinUmiDataConfig(
+            repo_id=_robotwin_umi_repo_id(),
+            dataset_root=_robotwin_umi_dataset_root(),
+            use_head_camera=_robotwin_umi_use_head_camera(),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        policy_metadata={
+            "protocol": "umi_v1",
+            "storage_action_representation": "umi_relative_se3_gripper_v1",
+            "model_action_representation": "umi_chunk_relative_se3_gripper_v1",
+            "state_representation": "joint_gripper",
+            "use_head_camera": _robotwin_umi_use_head_camera(),
+            "first_target_offset": 1,
+        },
+        batch_size=64,
+        fsdp_devices=1,
+        num_train_steps=30_000,
+    ),
     TrainConfig(
         name="pi05_base_aloha_full_sim_arx-x5_seed_0",
         model=pi0_config.Pi0Config(pi05=True),

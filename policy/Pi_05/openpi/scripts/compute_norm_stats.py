@@ -5,6 +5,8 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import dataclasses
+
 import numpy as np
 import tqdm
 import tyro
@@ -31,12 +33,19 @@ def create_torch_dataloader(
 ) -> tuple[_data_loader.Dataset, int]:
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    dataset_config = data_config
+    if data_config.norm_stats_camera_keys is not None:
+        dataset_config = dataclasses.replace(data_config, camera_keys=data_config.norm_stats_camera_keys)
+    dataset = _data_loader.create_torch_dataset(dataset_config, action_horizon, model_config)
+    input_transforms = (
+        data_config.norm_stats_transforms.inputs
+        if data_config.norm_stats_transforms is not None
+        else [*data_config.repack_transforms.inputs, *data_config.data_transforms.inputs]
+    )
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
+            *input_transforms,
             # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
             RemoveStrings(),
         ],

@@ -240,6 +240,16 @@ def validate_robot_state_dict(state_dict: dict, robot_action_dim_info: dict) -> 
         ValueError: if unexpected keys or wrong dimensions are found
         TypeError: if values are not array-like
     """
+    umi_keys = {"left_umi_action", "right_umi_action"}
+    if umi_keys & set(state_dict):
+        if set(state_dict) != umi_keys:
+            raise ValueError(f"UMI action must contain exactly {sorted(umi_keys)}, got {sorted(state_dict)}")
+        for key in sorted(umi_keys):
+            value = np.asarray(state_dict[key])
+            if value.shape != (7,):
+                raise ValueError(f"state_dict['{key}'] must have shape (7,), got {value.shape}")
+        return
+
     arm_dims = robot_action_dim_info["arm_dim"]
     ee_dims = robot_action_dim_info["ee_dim"]
 

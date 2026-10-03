@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as futures
 import dataclasses
+import json
 import logging
 from typing import Protocol
 
@@ -13,8 +14,19 @@ import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
+import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
+
+
+def _save_assets(directory: epath.Path, data_config: _config.DataConfig) -> None:
+    norm_stats = data_config.norm_stats
+    if norm_stats is not None and data_config.asset_id is not None:
+        _normalize.save(directory / data_config.asset_id, norm_stats)
+    if data_config.protocol_metadata is not None:
+        (directory / "umi_spec.json").write_text(
+            json.dumps(data_config.protocol_metadata, indent=2, sort_keys=True) + "\n"
+        )
 
 
 def initialize_checkpoint_dir(
@@ -69,11 +81,7 @@ def save_state(
     step: int,
 ):
     def save_assets(directory: epath.Path):
-        # Save the normalization stats.
-        data_config = data_loader.data_config()
-        norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(directory / data_config.asset_id, norm_stats)
+        _save_assets(directory, data_loader.data_config())
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():

@@ -20,6 +20,9 @@ except ModuleNotFoundError as exc:
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.lerobot_v21_dataset import LeRobotV21Dataset
+from openpi.training.lerobot_v21_dataset import LeRobotV21Metadata
+from openpi.training.lerobot_v21_dataset import is_lerobot_v21_dataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -66,6 +69,73 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class IndexedDataset(Dataset[T_co]):
+    """Expose a stable subset of another random-access dataset."""
+
+    def __init__(self, dataset: Dataset, indices: Sequence[int]):
+        self._dataset = dataset
+        self._indices = tuple(int(index) for index in indices)
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[self._indices[index.__index__()]]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
+def _episode_ranges(dataset) -> list[tuple[int, int]]:
+    """Return half-open global frame ranges across LeRobot 2.1 and 3.x."""
+
+    episode_data_index = getattr(dataset, "episode_data_index", None)
+    if episode_data_index is not None:
+        starts = np.asarray(episode_data_index["from"]).reshape(-1)
+        ends = np.asarray(episode_data_index["to"]).reshape(-1)
+        return [(int(start), int(end)) for start, end in zip(starts, ends, strict=True)]
+
+    episodes = getattr(dataset.meta, "episodes", None)
+    if episodes is None:
+        raise ValueError("LeRobot dataset does not expose episode boundaries")
+    episode_values = episodes.values() if isinstance(episodes, dict) else episodes
+    ranges = []
+    cursor = 0
+    for episode in episode_values:
+        if "dataset_from_index" in episode and "dataset_to_index" in episode:
+            start = int(episode["dataset_from_index"])
+            end = int(episode["dataset_to_index"])
+        else:
+            start = cursor
+            end = start + int(episode["length"])
+        ranges.append((start, end))
+        cursor = end
+    return ranges
+
+
+def _full_action_horizon_indices(dataset, action_horizon: int) -> list[int]:
+    if action_horizon < 1:
+        raise ValueError("action_horizon must be positive")
+    indices = []
+    for start, end in _episode_ranges(dataset):
+        # Starting at index t requests actions [t, ..., t + H - 1].
+        indices.extend(range(start, max(start, end - action_horizon + 1)))
+    if not indices:
+        raise ValueError(f"No episode contains a full action horizon of {action_horizon} frames")
+    return indices
+
+
+def _select_camera_features(dataset, camera_keys: Sequence[str] | None) -> None:
+    """Prevent disabled video streams from being decoded by LeRobot."""
+
+    if camera_keys is None:
+        return
+    selected = set(camera_keys)
+    available = set(dataset.meta.camera_keys)
+    missing = selected - available
+    if missing:
+        raise ValueError(f"Dataset is missing configured cameras: {tuple(sorted(missing))}")
+    for key in available - selected:
+        dataset.meta.info["features"].pop(key, None)
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -143,14 +213,32 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-        video_backend=data_config.video_backend,
-    )
+    if is_lerobot_v21_dataset(data_config.dataset_root):
+        dataset_meta = LeRobotV21Metadata(data_config.dataset_root)
+        dataset = LeRobotV21Dataset(
+            data_config.dataset_root,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(action_horizon)]
+                for key in data_config.action_sequence_keys
+            },
+            camera_keys=data_config.camera_keys,
+            video_backend=data_config.video_backend,
+        )
+    else:
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.dataset_root)
+        dataset = lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            root=data_config.dataset_root,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(action_horizon)]
+                for key in data_config.action_sequence_keys
+            },
+            video_backend=data_config.video_backend,
+        )
+        _select_camera_features(dataset, data_config.camera_keys)
+
+    if data_config.require_full_action_horizon:
+        dataset = IndexedDataset(dataset, _full_action_horizon_indices(dataset, action_horizon))
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
