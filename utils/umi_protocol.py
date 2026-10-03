@@ -21,7 +21,7 @@ import numpy as np
 UMI_PROTOCOL = "umi_v1"
 UMI_STORAGE_REPRESENTATION = "umi_relative_se3_gripper_v1"
 UMI_CHUNK_REPRESENTATION = "umi_chunk_relative_se3_gripper_v1"
-UMI_STATE_REPRESENTATION = "joint_gripper"
+UMI_STATE_REPRESENTATION = "episode_initial_relative_se3_gripper_v1"
 
 POSE_DIM = 7
 UMI_ARM_ACTION_DIM = 7
@@ -266,6 +266,99 @@ def matrix_to_relative_action(matrix: np.ndarray) -> np.ndarray:
     if matrix.shape != (4, 4):
         raise ValueError(f"relative transform must have shape (4, 4), got {matrix.shape}")
     return np.concatenate((matrix[:3, 3], matrix_to_rotvec(matrix[:3, :3])))
+
+
+def pose_relative_to_reference(pose: np.ndarray, reference_pose: np.ndarray) -> np.ndarray:
+    """Encode ``reference_pose^-1 * pose`` as ``xyz + rotvec``.
+
+    RoboTwin poses are ``[x, y, z, qw, qx, qy, qz]``.  The returned translation
+    is therefore expressed in the first-frame end-effector coordinate system,
+    rather than in the world frame.
+    """
+
+    relative = np.linalg.inv(pose_to_matrix(reference_pose)) @ pose_to_matrix(pose)
+    return matrix_to_relative_action(relative)
+
+
+def bimanual_episode_relative_ee_state(
+    left_poses: np.ndarray,
+    left_grippers: np.ndarray,
+    right_poses: np.ndarray,
+    right_grippers: np.ndarray,
+) -> np.ndarray:
+    """Build the 14-D UMI proprioceptive state for one complete episode.
+
+    The layout is ``[left_rel_xyz, left_rel_rotvec, left_gripper,
+    right_rel_xyz, right_rel_rotvec, right_gripper]``.  Each EEF pose is
+    relative to that arm's first recorded pose; grippers deliberately remain
+    absolute.  Input poses use RoboTwin's scalar-first quaternion convention
+    (``xyz + wxyz``).
+    """
+
+    def _poses(value: np.ndarray, name: str) -> np.ndarray:
+        result = np.asarray(value, dtype=np.float64)
+        if result.ndim != 2 or result.shape[1] != POSE_DIM:
+            raise ValueError(f"{name} must have shape (T, {POSE_DIM}), got {result.shape}")
+        if result.shape[0] == 0:
+            raise ValueError(f"{name} must contain at least one frame")
+        if not np.all(np.isfinite(result)):
+            raise ValueError(f"{name} must contain only finite values")
+        return result
+
+    def _grippers(value: np.ndarray, name: str, horizon: int) -> np.ndarray:
+        result = np.asarray(value, dtype=np.float64)
+        if result.ndim == 2 and result.shape[1] == 1:
+            result = result[:, 0]
+        if result.ndim != 1 or result.shape[0] != horizon:
+            raise ValueError(f"{name} must have shape (T,) or (T, 1), got {result.shape}")
+        if not np.all(np.isfinite(result)):
+            raise ValueError(f"{name} must contain only finite values")
+        return result
+
+    left_poses = _poses(left_poses, "left_poses")
+    right_poses = _poses(right_poses, "right_poses")
+    if left_poses.shape[0] != right_poses.shape[0]:
+        raise ValueError(
+            "left_poses and right_poses must have the same horizon: "
+            f"{left_poses.shape[0]} vs {right_poses.shape[0]}"
+        )
+    horizon = left_poses.shape[0]
+    left_grippers = _grippers(left_grippers, "left_grippers", horizon)
+    right_grippers = _grippers(right_grippers, "right_grippers", horizon)
+
+    result = np.empty((horizon, UMI_BIMANUAL_ACTION_DIM), dtype=np.float32)
+    left_reference = left_poses[0]
+    right_reference = right_poses[0]
+    for index in range(horizon):
+        result[index, :6] = pose_relative_to_reference(left_poses[index], left_reference)
+        result[index, 6] = left_grippers[index]
+        result[index, 7:13] = pose_relative_to_reference(right_poses[index], right_reference)
+        result[index, 13] = right_grippers[index]
+
+    # Exact zero at the reference frame is a useful data invariant and avoids
+    # numerical residue from matrix multiplication in serialized datasets.
+    result[0, :6] = 0.0
+    result[0, 7:13] = 0.0
+    return result
+
+
+def bimanual_relative_ee_state_from_reference(
+    left_pose: np.ndarray,
+    left_gripper: float,
+    right_pose: np.ndarray,
+    right_gripper: float,
+    *,
+    left_reference_pose: np.ndarray,
+    right_reference_pose: np.ndarray,
+) -> np.ndarray:
+    """Build one UMI state row relative to explicit episode-start poses."""
+
+    return bimanual_episode_relative_ee_state(
+        np.stack((np.asarray(left_reference_pose), np.asarray(left_pose))),
+        np.asarray((left_gripper, left_gripper)),
+        np.stack((np.asarray(right_reference_pose), np.asarray(right_pose))),
+        np.asarray((right_gripper, right_gripper)),
+    )[1]
 
 
 def adjacent_actions_to_chunk_targets(

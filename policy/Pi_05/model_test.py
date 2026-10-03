@@ -22,6 +22,26 @@ def test_encode_obs_can_exclude_head_camera():
     assert tuple(encoded["images"]) == ("cam_left_wrist", "cam_right_wrist")
 
 
+def test_encode_umi_obs_uses_relative_eef_state_not_joint_fields():
+    relative_state = np.arange(14, dtype=np.float32)
+    observation = {
+        "vision": {
+            "cam_left_wrist": {"rgb": np.zeros((4, 6, 3), dtype=np.uint8)},
+            "cam_right_wrist": {"rgb": np.ones((4, 6, 3), dtype=np.uint8)},
+        },
+        "state": {
+            "umi_relative_state": relative_state,
+            # A wrong-size legacy qpos field must not be read by the UMI path.
+            "left_arm_joint_state": np.arange(6, dtype=np.float32),
+        },
+        "instruction": "move",
+    }
+
+    encoded = pi05_model.encode_obs(observation, "umi", None, use_head_camera=False)
+    np.testing.assert_array_equal(encoded["state"], relative_state)
+    assert tuple(encoded["images"]) == ("cam_left_wrist", "cam_right_wrist")
+
+
 def test_checkpoint_manifest_must_match_camera_mode(tmp_path):
     spec = UmiProtocolSpec(use_head_camera=False)
     assets = tmp_path / "assets"

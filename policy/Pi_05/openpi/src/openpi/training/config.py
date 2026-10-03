@@ -400,7 +400,7 @@ class LeRobotRobotwinUmiDataConfig(DataConfigFactory):
                 "protocol": "umi_v1",
                 "storage_action_representation": "umi_relative_se3_gripper_v1",
                 "model_action_representation": "umi_chunk_relative_se3_gripper_v1",
-                "state_representation": "joint_gripper",
+                "state_representation": "episode_initial_relative_se3_gripper_v1",
                 "use_head_camera": self.use_head_camera,
                 "camera_roles": (
                     ["head", "left_wrist", "right_wrist"]
@@ -773,7 +773,7 @@ _CONFIGS = [
             "protocol": "umi_v1",
             "storage_action_representation": "umi_relative_se3_gripper_v1",
             "model_action_representation": "umi_chunk_relative_se3_gripper_v1",
-            "state_representation": "joint_gripper",
+            "state_representation": "episode_initial_relative_se3_gripper_v1",
             "use_head_camera": _robotwin_umi_use_head_camera(),
             "first_target_offset": 1,
         },

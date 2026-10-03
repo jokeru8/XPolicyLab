@@ -144,7 +144,10 @@ class Model(ModelTemplate):
 
     def update_obs_batch(self, obs_list):
         self._latest_env_idx_list = [obs.get("env_idx", index) for index, obs in enumerate(obs_list)]
-        state_action_type = "joint" if self._is_umi else self.action_type
+        # UMI has a separate state representation from its action representation:
+        # episode-start-relative EEF pose plus absolute gripper.  Do not route it
+        # through the legacy joint-state packer.
+        state_action_type = "umi" if self._is_umi else self.action_type
         use_head_camera = self.umi_spec.use_head_camera if self.umi_spec is not None else True
         encoded_obs_list = [
             encode_obs(
@@ -239,8 +242,9 @@ def _validate_umi_checkpoint(model_root: Path, spec: UmiProtocolSpec) -> None:
 
 
 def encode_obs(observation, action_type, robot_action_dim_info, *, use_head_camera=True):
+    is_umi = action_type in {"umi", "umi_relative", "relative_ee"}
     if "images" in observation and "state" in observation:
-        state = np.asarray(observation["state"], dtype=np.float32)
+        state = _extract_umi_relative_state(observation) if is_umi else np.asarray(observation["state"], dtype=np.float32)
         images = {
             "cam_left_wrist": ensure_chw_uint8(observation["images"]["cam_left_wrist"]),
             "cam_right_wrist": ensure_chw_uint8(observation["images"]["cam_right_wrist"]),
@@ -250,7 +254,7 @@ def encode_obs(observation, action_type, robot_action_dim_info, *, use_head_came
         prompt = _get_prompt(observation)
         return {"state": state, "images": images, "prompt": prompt}
 
-    if robot_action_dim_info is None:
+    if robot_action_dim_info is None and not is_umi:
         raise ValueError("env_cfg_type is required when encoding raw environment observations.")
 
     images = {
@@ -268,9 +272,31 @@ def encode_obs(observation, action_type, robot_action_dim_info, *, use_head_came
             ),
             **images,
         }
-    state = pack_robot_state(observation, action_type, robot_action_dim_info, source_type="obs").astype(np.float32)
+    if is_umi:
+        state = _extract_umi_relative_state(observation)
+    else:
+        state = pack_robot_state(observation, action_type, robot_action_dim_info, source_type="obs").astype(np.float32)
     prompt = _get_prompt(observation)
     return {"state": state, "images": images, "prompt": prompt}
+
+
+def _extract_umi_relative_state(observation: dict[str, Any]) -> np.ndarray:
+    """Read the UMI state emitted by the evaluator without joint repacking."""
+
+    source = observation.get("state")
+    value = source.get("umi_relative_state") if isinstance(source, dict) else source
+    if value is None:
+        raise KeyError(
+            "UMI observation is missing state.umi_relative_state "
+            "([left rel pose, left gripper, right rel pose, right gripper])."
+        )
+    state = np.asarray(value, dtype=np.float32)
+    if state.shape != (UMI_BIMANUAL_ACTION_DIM,):
+        raise ValueError(
+            "UMI relative state must have shape "
+            f"({UMI_BIMANUAL_ACTION_DIM},), got {state.shape}"
+        )
+    return state
 
 
 def stack_obs(obs_list: list[dict[str, Any]]) -> dict[str, Any]:

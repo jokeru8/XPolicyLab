@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from XPolicyLab.utils.data_loader import load
 from XPolicyLab.utils.load_file import load_json, load_yaml
 from XPolicyLab.utils.process_data import decode_image_bit
+from XPolicyLab.utils.umi_protocol import bimanual_episode_relative_ee_state
 
 
 DEFAULT_DATASET_NAME = "RoboDojo"
@@ -39,6 +40,15 @@ UMI_ACTION_COMPONENTS = (
     "delta_rotvec_x",
     "delta_rotvec_y",
     "delta_rotvec_z",
+    "gripper",
+)
+UMI_STATE_COMPONENTS = (
+    "rel_x",
+    "rel_y",
+    "rel_z",
+    "rel_rotvec_x",
+    "rel_rotvec_y",
+    "rel_rotvec_z",
     "gripper",
 )
 
@@ -208,6 +218,24 @@ def _build_umi_action_names(num_arms):
         f"{prefix}_{component}"
         for prefix in prefixes
         for component in UMI_ACTION_COMPONENTS
+    ]
+
+
+def _build_umi_state_names(num_arms):
+    """Names for initial-frame-relative EEF pose plus absolute gripper."""
+
+    if num_arms <= 0:
+        raise ValueError("num_arms must be positive")
+    if num_arms == 1:
+        prefixes = ["arm"]
+    elif num_arms == 2:
+        prefixes = ["left", "right"]
+    else:
+        prefixes = [f"arm_{index}" for index in range(num_arms)]
+    return [
+        f"{prefix}_{component}"
+        for prefix in prefixes
+        for component in UMI_STATE_COMPONENTS
     ]
 
 
@@ -492,6 +520,30 @@ def _extract_qpos(data):
     raise ValueError("Cannot find qpos data")
 
 
+def _extract_umi_episode_relative_state(data):
+    """Read raw EEF poses and make the UMI proprioceptive state.
+
+    Raw RoboTwin HDF5 intentionally retains world-frame EEF poses.  The
+    exported LeRobot state is the policy-facing representation: each arm is
+    expressed relative to its first pose in the episode, while gripper values
+    remain absolute.
+    """
+
+    required = {
+        "left_poses": _get_nested(data, "state", "left_ee_poses"),
+        "left_grippers": _get_nested(data, "state", "left_ee_joint_states"),
+        "right_poses": _get_nested(data, "state", "right_ee_poses"),
+        "right_grippers": _get_nested(data, "state", "right_ee_joint_states"),
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(
+            "Cannot build UMI episode-relative state; missing "
+            + ", ".join(f"state.{name}" for name in missing)
+        )
+    return bimanual_episode_relative_ee_state(**required)
+
+
 def _extract_action(data, action_type="joint"):
     if action_type == "umi":
         action = _concat_state_parts(
@@ -563,16 +615,22 @@ def convert_one(
 ):
     data = load(str(input_path), data_type=data_type, data_version=data_version)
 
-    state = _extract_qpos(data)
+    state = _extract_umi_episode_relative_state(data) if action_type == "umi" else _extract_qpos(data)
     action = _extract_action(data, action_type=action_type)
     if state.shape[0] != action.shape[0]:
         raise ValueError(f"state/action horizon mismatch: {state.shape[0]} vs {action.shape[0]}")
-    state = _pad_state_to_target_dims(state, current_dims, target_dims, "state")
     if action_type == "umi":
+        expected_state_dim = UMI_ACTION_DIM_PER_ARM * len(target_dims)
+        if state.shape[1] != expected_state_dim:
+            raise ValueError(
+                "UMI state dim mismatch: expected "
+                f"{expected_state_dim} for {len(target_dims)} arms, got {state.shape[1]}"
+            )
         umi_current_dims = [UMI_ACTION_DIM_PER_ARM] * len(current_dims)
         umi_target_dims = [UMI_ACTION_DIM_PER_ARM] * len(target_dims)
         action = _pad_state_to_target_dims(action, umi_current_dims, umi_target_dims, "action")
     else:
+        state = _pad_state_to_target_dims(state, current_dims, target_dims, "state")
         action = _pad_state_to_target_dims(action, current_dims, target_dims, "action")
     instruction = _choose_instruction(data)
     if not instruction:
@@ -691,7 +749,7 @@ def main():
     image_height, image_width = _resolve_image_hw(args, target_inputs)
     print(f"Image size: {image_height}x{image_width}")
     repo_id = args.repo_id or f"unified_{'_'.join(pattern.replace('*', 'all').replace('.', '_') for pattern in args.patterns)}".lower()
-    motors = _build_motor_names_from_dims(target_dims)
+    motors = _build_umi_state_names(len(target_dims)) if args.action_type == "umi" else _build_motor_names_from_dims(target_dims)
     action_motors = motors if args.action_type == "joint" else _build_umi_action_names(len(target_dims))
     fps = args.fps or max_fps or 50
     print(f"Action type: {args.action_type}; FPS: {fps}")
