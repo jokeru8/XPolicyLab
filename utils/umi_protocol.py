@@ -361,6 +361,54 @@ def bimanual_relative_ee_state_from_reference(
     )[1]
 
 
+def adjacent_actions_to_episode_relative_ee_state(
+    actions: np.ndarray,
+    left_grippers: np.ndarray,
+    right_grippers: np.ndarray,
+) -> np.ndarray:
+    """Recover episode-first-frame EEF state from adjacent UMI actions.
+
+    Row ``t`` of an adjacent-action sequence maps pose ``t`` to pose ``t+1``.
+    Accordingly, the returned state at row ``t`` is the prefix product of rows
+    ``[0, t)``.  This lets us upgrade an existing UMI LeRobot export without
+    touching its videos: it needs only the old absolute gripper columns.
+    """
+
+    actions = np.asarray(actions, dtype=np.float64)
+    if actions.ndim != 2 or actions.shape[1] != UMI_BIMANUAL_ACTION_DIM:
+        raise ValueError(
+            f"actions must have shape (T, {UMI_BIMANUAL_ACTION_DIM}), got {actions.shape}"
+        )
+    if actions.shape[0] == 0:
+        raise ValueError("actions must contain at least one frame")
+    if not np.all(np.isfinite(actions)):
+        raise ValueError("actions must contain only finite values")
+
+    horizon = actions.shape[0]
+
+    def _grippers(value: np.ndarray, name: str) -> np.ndarray:
+        result = np.asarray(value, dtype=np.float64)
+        if result.ndim == 2 and result.shape[1] == 1:
+            result = result[:, 0]
+        if result.ndim != 1 or result.shape[0] != horizon:
+            raise ValueError(f"{name} must have shape (T,) or (T, 1), got {result.shape}")
+        if not np.all(np.isfinite(result)):
+            raise ValueError(f"{name} must contain only finite values")
+        return result
+
+    left_grippers = _grippers(left_grippers, "left_grippers")
+    right_grippers = _grippers(right_grippers, "right_grippers")
+    result = np.empty((horizon, UMI_BIMANUAL_ACTION_DIM), dtype=np.float32)
+    cumulative = [np.eye(4, dtype=np.float64), np.eye(4, dtype=np.float64)]
+    for index, action in enumerate(actions):
+        for arm_index, offset in enumerate((0, UMI_ARM_ACTION_DIM)):
+            result[index, offset : offset + 6] = matrix_to_relative_action(cumulative[arm_index])
+            cumulative[arm_index] = cumulative[arm_index] @ relative_action_to_matrix(action[offset : offset + 6])
+        result[index, 6] = left_grippers[index]
+        result[index, 13] = right_grippers[index]
+    return result
+
+
 def adjacent_actions_to_chunk_targets(
     actions: np.ndarray,
     action_is_pad: np.ndarray | None = None,
