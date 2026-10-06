@@ -9,6 +9,7 @@ import einops
 import numpy as np
 from XPolicyLab.utils.umi_protocol import UMI_BIMANUAL_ACTION_DIM
 from XPolicyLab.utils.umi_protocol import adjacent_actions_to_chunk_targets
+from XPolicyLab.utils.umi_protocol import rebase_episode_relative_state_history
 
 from openpi import transforms
 
@@ -49,6 +50,8 @@ class RobotwinUmiInputs(transforms.DataTransformFn):
     """Map RoboTwin observations and adjacent UMI actions into π0.5 inputs."""
 
     use_head_camera: bool = False
+    use_proprioception: bool = True
+    observation_steps: int = 2
 
     EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
@@ -64,9 +67,7 @@ class RobotwinUmiInputs(transforms.DataTransformFn):
         left_wrist = _parse_image(in_images["cam_left_wrist"])
         right_wrist = _parse_image(in_images["cam_right_wrist"])
         if left_wrist.shape != right_wrist.shape:
-            raise ValueError(
-                f"Wrist cameras must have matching shapes, got {left_wrist.shape} and {right_wrist.shape}"
-            )
+            raise ValueError(f"Wrist cameras must have matching shapes, got {left_wrist.shape} and {right_wrist.shape}")
 
         if self.use_head_camera:
             if "cam_high" not in in_images:
@@ -90,7 +91,11 @@ class RobotwinUmiInputs(transforms.DataTransformFn):
                 "left_wrist_0_rgb": _make_image_mask(left_wrist, valid=True),
                 "right_wrist_0_rgb": _make_image_mask(right_wrist, valid=True),
             },
-            "state": np.asarray(data["state"], dtype=np.float32),
+            "state": _prepare_model_state(
+                data.get("state"),
+                use_proprioception=self.use_proprioception,
+                observation_steps=self.observation_steps,
+            ),
         }
 
         if "actions" in data:
@@ -112,9 +117,7 @@ class RobotwinUmiOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         actions = np.asarray(data["actions"])
         if actions.shape[-1] < UMI_BIMANUAL_ACTION_DIM:
-            raise ValueError(
-                f"π0.5 output has {actions.shape[-1]} dims, expected at least {UMI_BIMANUAL_ACTION_DIM}"
-            )
+            raise ValueError(f"π0.5 output has {actions.shape[-1]} dims, expected at least {UMI_BIMANUAL_ACTION_DIM}")
         return {"actions": actions[..., :UMI_BIMANUAL_ACTION_DIM]}
 
 
@@ -122,12 +125,50 @@ class RobotwinUmiOutputs(transforms.DataTransformFn):
 class RobotwinUmiNormInputs(transforms.DataTransformFn):
     """Prepare only numeric state/action fields for normalization statistics."""
 
+    use_proprioception: bool = True
+    observation_steps: int = 2
+
     def __call__(self, data: dict) -> dict:
         action_is_pad = data.get("action_is_pad")
         return {
-            "state": np.asarray(data["state"], dtype=np.float32),
+            "state": _prepare_model_state(
+                data.get("state"),
+                use_proprioception=self.use_proprioception,
+                observation_steps=self.observation_steps,
+            ),
             "actions": adjacent_actions_to_chunk_targets(
                 np.asarray(data["actions"]),
                 None if action_is_pad is None else np.asarray(action_is_pad),
             ).astype(np.float32),
         }
+
+
+def _prepare_model_state(
+    state_history: np.ndarray | None,
+    *,
+    use_proprioception: bool,
+    observation_steps: int,
+) -> np.ndarray:
+    """Create the flattened UMI state consumed by π0.5."""
+
+    if observation_steps < 1:
+        raise ValueError("observation_steps must be positive")
+    if not use_proprioception:
+        return np.zeros(observation_steps * UMI_BIMANUAL_ACTION_DIM, dtype=np.float32)
+    if state_history is None:
+        raise KeyError("use_proprioception=true requires observation.state")
+
+    history = np.asarray(state_history, dtype=np.float32)
+    expected_shape = (observation_steps, UMI_BIMANUAL_ACTION_DIM)
+    if history.shape != expected_shape:
+        raise ValueError(f"UMI state history must have shape {expected_shape}, got {history.shape}")
+    return rebase_episode_relative_state_history(history).reshape(-1).astype(np.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class ZeroState(transforms.DataTransformFn):
+    """Remove the normalized state signal for camera-only ablations."""
+
+    def __call__(self, data: dict) -> dict:
+        data["state"] = np.zeros_like(np.asarray(data["state"], dtype=np.float32))
+        return data

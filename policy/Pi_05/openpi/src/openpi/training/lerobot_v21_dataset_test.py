@@ -47,9 +47,7 @@ def _make_dataset(root):
             "total_frames": 6,
             "chunks_size": 1000,
             "fps": 10,
-            "video_path": (
-                "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
-            ),
+            "video_path": ("videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"),
             "features": features,
         },
     )
@@ -100,7 +98,7 @@ def test_v21_reader_queries_actions_without_crossing_episode(tmp_path, monkeypat
     monkeypatch.setattr(lerobot_v21_dataset, "decode_video_frames", fake_decode)
     dataset = lerobot_v21_dataset.LeRobotV21Dataset(
         tmp_path,
-        delta_timestamps={"action": [0.0, 0.1]},
+        delta_timestamps={"action": [0.0, 0.1], "observation.state": [-0.2, 0.0]},
         camera_keys=(
             "observation.images.cam_left_wrist",
             "observation.images.cam_right_wrist",
@@ -110,6 +108,8 @@ def test_v21_reader_queries_actions_without_crossing_episode(tmp_path, monkeypat
     item = dataset[2]
     np.testing.assert_array_equal(item["action"], [[2.0, 1.0], [2.0, 1.0]])
     np.testing.assert_array_equal(item["action_is_pad"], [False, True])
+    np.testing.assert_array_equal(item["observation.state"], [[0.0, 0.0], [2.0, 0.0]])
+    np.testing.assert_array_equal(item["observation.state_is_pad"], [False, False])
     assert item["task"] == "first task"
     assert len(decoded_paths) == 2
     assert all("cam_high" not in path for path in decoded_paths)

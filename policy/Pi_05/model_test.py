@@ -42,6 +42,46 @@ def test_encode_umi_obs_uses_relative_eef_state_not_joint_fields():
     assert tuple(encoded["images"]) == ("cam_left_wrist", "cam_right_wrist")
 
 
+def test_encode_camera_only_umi_obs_does_not_require_state():
+    observation = {
+        "images": {
+            "cam_left_wrist": np.zeros((3, 4, 6), dtype=np.uint8),
+            "cam_right_wrist": np.ones((3, 4, 6), dtype=np.uint8),
+        },
+        "instruction": "move",
+    }
+    encoded = pi05_model.encode_obs(
+        observation,
+        "umi",
+        None,
+        use_head_camera=False,
+        use_proprioception=False,
+    )
+    np.testing.assert_array_equal(encoded["state"], np.zeros(14, dtype=np.float32))
+
+
+def test_runtime_history_is_causal_strided_and_padded_from_the_past():
+    from collections import deque
+
+    history = deque(
+        (np.full(14, index, dtype=np.float32) for index in range(5)), maxlen=7
+    )
+    sampled = pi05_model._sample_umi_state_history(  # noqa: SLF001
+        history,
+        observation_steps=2,
+        observation_stride=3,
+    )
+    np.testing.assert_array_equal(sampled[:, 0], [1.0, 4.0])
+
+    startup = deque((np.full(14, 2.0, dtype=np.float32),), maxlen=7)
+    sampled = pi05_model._sample_umi_state_history(  # noqa: SLF001
+        startup,
+        observation_steps=2,
+        observation_stride=3,
+    )
+    np.testing.assert_array_equal(sampled[:, 0], [2.0, 2.0])
+
+
 def test_checkpoint_manifest_must_match_camera_mode(tmp_path):
     spec = UmiProtocolSpec(use_head_camera=False)
     assets = tmp_path / "assets"
@@ -51,6 +91,10 @@ def test_checkpoint_manifest_must_match_camera_mode(tmp_path):
 
     mismatched = UmiProtocolSpec(use_head_camera=True)
     with pytest.raises(ValueError, match="use_head_camera"):
+        pi05_model._validate_umi_checkpoint(tmp_path, mismatched)
+
+    mismatched = UmiProtocolSpec(use_proprioception=False)
+    with pytest.raises(ValueError, match="use_proprioception"):
         pi05_model._validate_umi_checkpoint(tmp_path, mismatched)
 
 

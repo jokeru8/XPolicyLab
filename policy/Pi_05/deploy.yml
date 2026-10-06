@@ -16,8 +16,13 @@ obs_transform_pipeline: "xspark-v1.0"
 action_type: umi
 action_protocol: umi_v1
 use_head_camera: false
-observation_steps: 1
+use_proprioception: true
+observation_steps: 2
+observation_stride: 3
 action_horizon: 50
+# Online evaluation executes the entire predicted UMI chunk before replanning.
+# This is an inference scheduling choice; it is intentionally independent of
+# the training-time protocol manifest's execute_steps field.
 execute_steps: 50
 policy_uv_env_path: openpi
 # Must match the config used by train.sh (default OPENPI_TRAIN_CONFIG_NAME).

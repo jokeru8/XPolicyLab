@@ -3,7 +3,9 @@
 """
 #!/usr/bin/python3
 """
+
 from pathlib import Path
+from collections import deque
 import dataclasses
 import json
 from typing import Any
@@ -49,7 +51,9 @@ def _resolve_pi05_model_root(model_cfg: dict[str, Any]) -> Path:
     )
     if not candidates:
         raise ValueError("ckpt_name or model_path is required for Pi_05.")
-    checkpoint_root = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+    checkpoint_root = next(
+        (candidate for candidate in candidates if candidate.exists()), candidates[0]
+    )
     if not checkpoint_root.is_dir():
         return checkpoint_root
 
@@ -59,7 +63,8 @@ def _resolve_pi05_model_root(model_cfg: dict[str, Any]) -> Path:
     candidate_dirs.extend(
         child
         for child in sorted(checkpoint_root.iterdir())
-        if child.is_dir() and ((child / "params").exists() or (child / "assets").exists())
+        if child.is_dir()
+        and ((child / "params").exists() or (child / "assets").exists())
     )
     if not candidate_dirs:
         return checkpoint_root
@@ -83,9 +88,16 @@ def _resolve_pi05_model_root(model_cfg: dict[str, Any]) -> Path:
             if candidate_step in {desired_step, scaled_step}:
                 return candidate
 
-    numeric_dirs = [candidate for candidate in candidate_dirs if _extract_step_number(candidate.name) is not None]
+    numeric_dirs = [
+        candidate
+        for candidate in candidate_dirs
+        if _extract_step_number(candidate.name) is not None
+    ]
     if numeric_dirs:
-        return max(numeric_dirs, key=lambda candidate: _extract_step_number(candidate.name) or -1)
+        return max(
+            numeric_dirs,
+            key=lambda candidate: _extract_step_number(candidate.name) or -1,
+        )
     return candidate_dirs[0]
 
 
@@ -96,12 +108,17 @@ class Model(ModelTemplate):
         self.action_type = model_cfg.get("action_type", "joint")
         self._is_umi = self.action_type in {"umi", "umi_relative", "relative_ee"}
         self.robot_action_dim_info = (
-            get_robot_action_dim_info(model_cfg["env_cfg_type"]) if model_cfg.get("env_cfg_type") is not None else None
+            get_robot_action_dim_info(model_cfg["env_cfg_type"])
+            if model_cfg.get("env_cfg_type") is not None
+            else None
         )
         self.observation_window: dict[str, Any] | None = None
         self._latest_env_idx_list: list[int] = [0]
+        self._umi_state_histories: dict[Any, deque[np.ndarray]] = {}
 
-        self.policy, self.train_config, self.model_root, self.umi_spec = self.get_model(model_cfg=model_cfg)
+        self.policy, self.train_config, self.model_root, self.umi_spec = self.get_model(
+            model_cfg=model_cfg
+        )
         self.model = self.policy
 
     def get_model(self, model_cfg: dict[str, Any]):
@@ -125,43 +142,98 @@ class Model(ModelTemplate):
             _validate_umi_checkpoint(model_root, umi_spec)
             config = dataclasses.replace(
                 config,
-                data=dataclasses.replace(config.data, use_head_camera=umi_spec.use_head_camera),
+                data=dataclasses.replace(
+                    config.data,
+                    use_head_camera=umi_spec.use_head_camera,
+                    use_proprioception=umi_spec.use_proprioception,
+                    observation_steps=umi_spec.observation_steps,
+                    observation_stride=umi_spec.observation_stride,
+                ),
             )
         elif isinstance(config.data, _config.LeRobotRobotwinUmiDataConfig):
-            raise ValueError("The pi05_robotwin_umi train config requires action_type='umi'")
+            raise ValueError(
+                "The pi05_robotwin_umi train config requires action_type='umi'"
+            )
 
         data_config = config.data.create(config.assets_dirs, config.model)
-        repo_id = model_cfg.get("repo_id", data_config.asset_id)
+        manifest_path = model_root / "assets" / "umi_spec.json"
+        manifest = (
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+            if self._is_umi
+            else {}
+        )
+        repo_id = model_cfg.get(
+            "asset_id", manifest.get("asset_id", data_config.asset_id)
+        )
         norm_stats = None
         if repo_id is not None:
             norm_stats = _normalize.load(model_root / "assets" / str(repo_id))
 
-        policy = _policy_config.create_trained_policy(config, str(model_root), norm_stats=norm_stats)
+        policy = _policy_config.create_trained_policy(
+            config, str(model_root), norm_stats=norm_stats
+        )
         return policy, config, model_root, umi_spec
 
     def update_obs(self, obs):
         self.update_obs_batch([obs])
 
     def update_obs_batch(self, obs_list):
-        self._latest_env_idx_list = [obs.get("env_idx", index) for index, obs in enumerate(obs_list)]
+        self._latest_env_idx_list = [
+            obs.get("env_idx", index) for index, obs in enumerate(obs_list)
+        ]
         # UMI has a separate state representation from its action representation:
         # episode-start-relative EEF pose plus absolute gripper.  Do not route it
         # through the legacy joint-state packer.
         state_action_type = "umi" if self._is_umi else self.action_type
-        use_head_camera = self.umi_spec.use_head_camera if self.umi_spec is not None else True
+        use_head_camera = (
+            self.umi_spec.use_head_camera if self.umi_spec is not None else True
+        )
         encoded_obs_list = [
             encode_obs(
                 obs,
                 state_action_type,
                 self.robot_action_dim_info,
                 use_head_camera=use_head_camera,
+                use_proprioception=(
+                    self.umi_spec.use_proprioception
+                    if self.umi_spec is not None
+                    else True
+                ),
             )
             for obs in obs_list
         ]
+        if self.umi_spec is not None:
+            for env_idx, encoded_obs in zip(
+                self._latest_env_idx_list, encoded_obs_list, strict=True
+            ):
+                if self.umi_spec.use_proprioception:
+                    history = self._umi_state_histories.setdefault(
+                        env_idx,
+                        deque(
+                            maxlen=(self.umi_spec.observation_steps - 1)
+                            * self.umi_spec.observation_stride
+                            + 1
+                        ),
+                    )
+                    history.append(
+                        np.asarray(encoded_obs["state"], dtype=np.float32).copy()
+                    )
+                    encoded_obs["state"] = _sample_umi_state_history(
+                        history,
+                        observation_steps=self.umi_spec.observation_steps,
+                        observation_stride=self.umi_spec.observation_stride,
+                    )
+                else:
+                    encoded_obs["state"] = np.zeros(
+                        (self.umi_spec.observation_steps, UMI_BIMANUAL_ACTION_DIM),
+                        dtype=np.float32,
+                    )
         self.observation_window = stack_obs(encoded_obs_list)
 
     def get_action(self, **kwargs):
-        action_list = self.get_action_batch(env_idx_list=[self._latest_env_idx_list[0]], **kwargs)
+        action_list = self.get_action_batch(
+            env_idx_list=[self._latest_env_idx_list[0]], **kwargs
+        )
         return action_list[0]
 
     def get_action_batch(self, env_idx_list=None, **kwargs):
@@ -193,7 +265,11 @@ class Model(ModelTemplate):
                         f"pi05 UMI policy returned horizon {actions.shape[0]}, "
                         f"expected {self.umi_spec.action_horizon}"
                     )
-                action_list.append(chunk_targets_to_action_dicts(actions[: self.umi_spec.execute_steps]))
+                action_list.append(
+                    chunk_targets_to_action_dicts(
+                        actions[: self.umi_spec.execute_steps]
+                    )
+                )
             elif self.robot_action_dim_info is None:
                 action_list.append(actions)
             else:
@@ -211,6 +287,7 @@ class Model(ModelTemplate):
     def reset(self):
         self.observation_window = None
         self._latest_env_idx_list = [0]
+        self._umi_state_histories.clear()
 
     def reset_obsrvationwindows(self):
         self.reset()
@@ -230,6 +307,9 @@ def _validate_umi_checkpoint(model_root: Path, spec: UmiProtocolSpec) -> None:
         "model_action_representation",
         "state_representation",
         "use_head_camera",
+        "use_proprioception",
+        "observation_steps",
+        "observation_stride",
         "action_dim",
         "action_horizon",
         "first_target_offset",
@@ -241,41 +321,76 @@ def _validate_umi_checkpoint(model_root: Path, spec: UmiProtocolSpec) -> None:
             )
 
 
-def encode_obs(observation, action_type, robot_action_dim_info, *, use_head_camera=True):
+def encode_obs(
+    observation,
+    action_type,
+    robot_action_dim_info,
+    *,
+    use_head_camera=True,
+    use_proprioception=True,
+):
     is_umi = action_type in {"umi", "umi_relative", "relative_ee"}
-    if "images" in observation and "state" in observation:
-        state = _extract_umi_relative_state(observation) if is_umi else np.asarray(observation["state"], dtype=np.float32)
+    if "images" in observation:
+        if is_umi:
+            state = (
+                _extract_umi_relative_state(observation)
+                if use_proprioception
+                else np.zeros(UMI_BIMANUAL_ACTION_DIM, dtype=np.float32)
+            )
+        else:
+            state = np.asarray(observation["state"], dtype=np.float32)
         images = {
             "cam_left_wrist": ensure_chw_uint8(observation["images"]["cam_left_wrist"]),
-            "cam_right_wrist": ensure_chw_uint8(observation["images"]["cam_right_wrist"]),
+            "cam_right_wrist": ensure_chw_uint8(
+                observation["images"]["cam_right_wrist"]
+            ),
         }
         if use_head_camera:
-            images = {"cam_high": ensure_chw_uint8(observation["images"]["cam_high"]), **images}
+            images = {
+                "cam_high": ensure_chw_uint8(observation["images"]["cam_high"]),
+                **images,
+            }
         prompt = _get_prompt(observation)
         return {"state": state, "images": images, "prompt": prompt}
 
     if robot_action_dim_info is None and not is_umi:
-        raise ValueError("env_cfg_type is required when encoding raw environment observations.")
+        raise ValueError(
+            "env_cfg_type is required when encoding raw environment observations."
+        )
 
     images = {
         "cam_left_wrist": ensure_chw_uint8(
-            extract_image(observation, ["cam_left_wrist", "left_camera", "left_wrist", "wrist_left"])
+            extract_image(
+                observation,
+                ["cam_left_wrist", "left_camera", "left_wrist", "wrist_left"],
+            )
         ),
         "cam_right_wrist": ensure_chw_uint8(
-            extract_image(observation, ["cam_right_wrist", "right_camera", "right_wrist", "wrist_right"])
+            extract_image(
+                observation,
+                ["cam_right_wrist", "right_camera", "right_wrist", "wrist_right"],
+            )
         ),
     }
     if use_head_camera:
         images = {
             "cam_high": ensure_chw_uint8(
-                extract_image(observation, ["cam_high", "cam_head", "head_camera", "top_camera"])
+                extract_image(
+                    observation, ["cam_high", "cam_head", "head_camera", "top_camera"]
+                )
             ),
             **images,
         }
     if is_umi:
-        state = _extract_umi_relative_state(observation)
+        state = (
+            _extract_umi_relative_state(observation)
+            if use_proprioception
+            else np.zeros(UMI_BIMANUAL_ACTION_DIM, dtype=np.float32)
+        )
     else:
-        state = pack_robot_state(observation, action_type, robot_action_dim_info, source_type="obs").astype(np.float32)
+        state = pack_robot_state(
+            observation, action_type, robot_action_dim_info, source_type="obs"
+        ).astype(np.float32)
     prompt = _get_prompt(observation)
     return {"state": state, "images": images, "prompt": prompt}
 
@@ -299,17 +414,40 @@ def _extract_umi_relative_state(observation: dict[str, Any]) -> np.ndarray:
     return state
 
 
+def _sample_umi_state_history(
+    history: deque[np.ndarray],
+    *,
+    observation_steps: int,
+    observation_stride: int,
+) -> np.ndarray:
+    """Select causal, strided state history and repeat the oldest frame at startup."""
+
+    if not history:
+        raise ValueError("UMI state history must not be empty")
+    values = list(history)
+    latest_index = len(values) - 1
+    selected = []
+    for step in range(observation_steps):
+        frames_back = (observation_steps - 1 - step) * observation_stride
+        selected.append(values[max(0, latest_index - frames_back)])
+    return np.stack(selected, axis=0).astype(np.float32)
+
+
 def stack_obs(obs_list: list[dict[str, Any]]) -> dict[str, Any]:
     if not obs_list:
         raise ValueError("obs_list must not be empty")
     image_names = tuple(obs_list[0]["images"])
     for obs in obs_list[1:]:
         if tuple(obs["images"]) != image_names:
-            raise ValueError("Every observation in a batch must contain the same ordered camera roles")
+            raise ValueError(
+                "Every observation in a batch must contain the same ordered camera roles"
+            )
     return {
         "state": np.stack([obs["state"] for obs in obs_list], axis=0),
         "images": {
-            image_name: np.stack([obs["images"][image_name] for obs in obs_list], axis=0)
+            image_name: np.stack(
+                [obs["images"][image_name] for obs in obs_list], axis=0
+            )
             for image_name in image_names
         },
         "prompt": [obs["prompt"] for obs in obs_list],
@@ -320,7 +458,8 @@ def slice_stacked_obs(obs: dict[str, Any], batch_index: int) -> dict[str, Any]:
     return {
         "state": obs["state"][batch_index],
         "images": {
-            image_name: images[batch_index] for image_name, images in obs["images"].items()
+            image_name: images[batch_index]
+            for image_name, images in obs["images"].items()
         },
         "prompt": obs["prompt"][batch_index],
     }

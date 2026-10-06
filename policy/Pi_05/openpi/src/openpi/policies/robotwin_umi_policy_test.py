@@ -16,7 +16,9 @@ def _sample(*, use_head: bool = True) -> dict:
     actions[:, 7] = 0.2
     return {
         "images": images,
-        "state": np.arange(14, dtype=np.float32),
+        "state": np.stack(
+            (np.zeros(14, dtype=np.float32), np.zeros(14, dtype=np.float32)),
+        ),
         "actions": actions,
         "prompt": "move both arms",
     }
@@ -56,3 +58,37 @@ def test_norm_inputs_do_not_require_images():
     result = robotwin_umi_policy.RobotwinUmiNormInputs()(sample)
     assert set(result) == {"state", "actions"}
     np.testing.assert_allclose(result["actions"][:, 0], [0.1, 0.2, 0.3], atol=1e-6)
+
+
+def test_proprioception_is_rebased_to_latest_pose_and_flattened():
+    sample = _sample(use_head=False)
+    sample["state"][0, 6] = 0.25
+    sample["state"][0, 13] = 0.5
+    sample["state"][1, 0] = 1.0
+    sample["state"][1, 8] = 2.0
+    sample["state"][1, 6] = 0.75
+    sample["state"][1, 13] = 1.0
+
+    result = robotwin_umi_policy.RobotwinUmiInputs(use_head_camera=False)(sample)
+    state = result["state"].reshape(2, 14)
+    np.testing.assert_allclose(state[0, :6], [-1.0, 0, 0, 0, 0, 0], atol=1e-6)
+    np.testing.assert_allclose(state[0, 7:13], [0, -2.0, 0, 0, 0, 0], atol=1e-6)
+    np.testing.assert_allclose(state[1, :6], 0.0, atol=1e-7)
+    np.testing.assert_allclose(state[1, 7:13], 0.0, atol=1e-7)
+    np.testing.assert_allclose(state[:, [6, 13]], [[0.25, 0.5], [0.75, 1.0]])
+
+
+def test_no_proprioception_does_not_require_state_and_is_exactly_zero():
+    sample = _sample(use_head=False)
+    sample.pop("state")
+    transform = robotwin_umi_policy.RobotwinUmiInputs(
+        use_head_camera=False,
+        use_proprioception=False,
+    )
+    result = transform(sample)
+    np.testing.assert_array_equal(result["state"], np.zeros(28, dtype=np.float32))
+
+    # This second transform runs after normalization in the configured pipeline.
+    normalized = {"state": np.full(28, -1.0, dtype=np.float32)}
+    robotwin_umi_policy.ZeroState()(normalized)
+    np.testing.assert_array_equal(normalized["state"], np.zeros(28, dtype=np.float32))

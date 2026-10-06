@@ -1,7 +1,7 @@
 """See _CONFIGS for the list of available configs."""
 
 import abc
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import dataclasses
 import difflib
 import logging
@@ -13,10 +13,11 @@ import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
 import tyro
+from XPolicyLab.utils.umi_protocol import UMI_BIMANUAL_ACTION_DIM
+from XPolicyLab.utils.umi_protocol import UmiProtocolSpec
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
-import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -26,8 +27,6 @@ import openpi.policies.wuji_policy as wuji_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
-import openpi.training.misc.polaris_config as polaris_config
-import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -50,6 +49,44 @@ def _robotwin_umi_use_head_camera() -> bool:
     if value in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"OPENPI_USE_HEAD_CAMERA must be a boolean, got {value!r}")
+
+
+def _environment_bool(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name, str(default)).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
+def _robotwin_umi_use_proprioception() -> bool:
+    return _environment_bool("OPENPI_USE_PROPRIOCEPTION", default=True)
+
+
+def _robotwin_umi_observation_stride() -> int:
+    value = int(os.environ.get("OPENPI_UMI_OBSERVATION_STRIDE", "3"))
+    if value < 1:
+        raise ValueError("OPENPI_UMI_OBSERVATION_STRIDE must be positive")
+    return value
+
+
+def _robotwin_umi_observation_steps() -> int:
+    value = int(os.environ.get("OPENPI_UMI_OBSERVATION_STEPS", "2"))
+    if value < 1:
+        raise ValueError("OPENPI_UMI_OBSERVATION_STEPS must be positive")
+    return value
+
+
+def _robotwin_umi_asset_id() -> str:
+    explicit = os.environ.get("OPENPI_UMI_ASSET_ID")
+    if explicit:
+        return explicit
+    mode = "proprio" if _robotwin_umi_use_proprioception() else "no_proprio"
+    return (
+        f"{_robotwin_umi_repo_id()}_{mode}"
+        f"_s{_robotwin_umi_observation_steps()}_stride{_robotwin_umi_observation_stride()}"
+    )
 
 
 def _robotwin_umi_repo_id() -> str:
@@ -120,6 +157,13 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+
+    # Additional temporal features sampled at integer frame offsets.  This is
+    # used by UMI to retrieve past EEF states without changing the dataset.
+    temporal_query_offsets: Mapping[str, Sequence[int]] = dataclasses.field(default_factory=dict)
+
+    # Optional semantic guard for same-shaped features with different meanings.
+    expected_feature_names: Mapping[str, Sequence[str]] = dataclasses.field(default_factory=dict)
 
     # Restrict video decoding to these full LeRobot feature keys.  None keeps
     # every camera advertised by the dataset.
@@ -340,9 +384,25 @@ class LeRobotRobotwinUmiDataConfig(DataConfigFactory):
     """
 
     use_head_camera: bool = False
+    use_proprioception: bool = True
+    observation_steps: int = 2
+    observation_stride: int = 3
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        spec = UmiProtocolSpec(
+            use_head_camera=self.use_head_camera,
+            use_proprioception=self.use_proprioception,
+            observation_steps=self.observation_steps,
+            observation_stride=self.observation_stride,
+            action_horizon=model_config.action_horizon,
+        )
+        model_state_dim = self.observation_steps * UMI_BIMANUAL_ACTION_DIM
+        if model_state_dim > model_config.action_dim:
+            raise ValueError(
+                f"UMI state history has {model_state_dim} dims, but the model only supports "
+                f"{model_config.action_dim}; reduce observation_steps or increase the model dimension"
+            )
         image_mapping = {
             "cam_left_wrist": "observation.images.cam_left_wrist",
             "cam_right_wrist": "observation.images.cam_right_wrist",
@@ -369,7 +429,13 @@ class LeRobotRobotwinUmiDataConfig(DataConfigFactory):
             ]
         )
         data_transforms = _transforms.Group(
-            inputs=[robotwin_umi_policy.RobotwinUmiInputs(use_head_camera=self.use_head_camera)],
+            inputs=[
+                robotwin_umi_policy.RobotwinUmiInputs(
+                    use_head_camera=self.use_head_camera,
+                    use_proprioception=self.use_proprioception,
+                    observation_steps=self.observation_steps,
+                )
+            ],
             outputs=[robotwin_umi_policy.RobotwinUmiOutputs()],
         )
         norm_stats_transforms = _transforms.Group(
@@ -381,10 +447,22 @@ class LeRobotRobotwinUmiDataConfig(DataConfigFactory):
                         "action_is_pad": "action_is_pad",
                     }
                 ),
-                robotwin_umi_policy.RobotwinUmiNormInputs(),
+                robotwin_umi_policy.RobotwinUmiNormInputs(
+                    use_proprioception=self.use_proprioception,
+                    observation_steps=self.observation_steps,
+                ),
             ]
         )
         model_transforms = ModelTransformFactory()(model_config)
+        if not self.use_proprioception:
+            model_transforms = _transforms.Group(
+                inputs=(robotwin_umi_policy.ZeroState(), *model_transforms.inputs),
+                outputs=model_transforms.outputs,
+            )
+
+        state_offsets = tuple(
+            (index - self.observation_steps + 1) * self.observation_stride for index in range(self.observation_steps)
+        )
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -392,24 +470,32 @@ class LeRobotRobotwinUmiDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=("action",),
+            temporal_query_offsets={"observation.state": state_offsets},
+            expected_feature_names={
+                "observation.state": (
+                    "left_rel_x",
+                    "left_rel_y",
+                    "left_rel_z",
+                    "left_rel_rotvec_x",
+                    "left_rel_rotvec_y",
+                    "left_rel_rotvec_z",
+                    "left_gripper",
+                    "right_rel_x",
+                    "right_rel_y",
+                    "right_rel_z",
+                    "right_rel_rotvec_x",
+                    "right_rel_rotvec_y",
+                    "right_rel_rotvec_z",
+                    "right_gripper",
+                )
+            },
             camera_keys=tuple(camera_keys),
             require_full_action_horizon=True,
             norm_stats_transforms=norm_stats_transforms,
             norm_stats_camera_keys=(),
             protocol_metadata={
-                "protocol": "umi_v1",
-                "storage_action_representation": "umi_relative_se3_gripper_v1",
-                "model_action_representation": "umi_chunk_relative_se3_gripper_v1",
-                "state_representation": "episode_initial_relative_se3_gripper_v1",
-                "use_head_camera": self.use_head_camera,
-                "camera_roles": (
-                    ["head", "left_wrist", "right_wrist"]
-                    if self.use_head_camera
-                    else ["left_wrist", "right_wrist"]
-                ),
-                "action_dim": 14,
-                "action_horizon": model_config.action_horizon,
-                "first_target_offset": 1,
+                **spec.to_dict(),
+                "asset_id": self.assets.asset_id or self.repo_id,
             },
         )
 
@@ -765,17 +851,23 @@ _CONFIGS = [
         data=LeRobotRobotwinUmiDataConfig(
             repo_id=_robotwin_umi_repo_id(),
             dataset_root=_robotwin_umi_dataset_root(),
+            assets=AssetsConfig(asset_id=_robotwin_umi_asset_id()),
             use_head_camera=_robotwin_umi_use_head_camera(),
+            use_proprioception=_robotwin_umi_use_proprioception(),
+            observation_steps=_robotwin_umi_observation_steps(),
+            observation_stride=_robotwin_umi_observation_stride(),
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         policy_metadata={
-            "protocol": "umi_v1",
-            "storage_action_representation": "umi_relative_se3_gripper_v1",
-            "model_action_representation": "umi_chunk_relative_se3_gripper_v1",
-            "state_representation": "episode_initial_relative_se3_gripper_v1",
-            "use_head_camera": _robotwin_umi_use_head_camera(),
-            "first_target_offset": 1,
+            **UmiProtocolSpec(
+                use_head_camera=_robotwin_umi_use_head_camera(),
+                use_proprioception=_robotwin_umi_use_proprioception(),
+                observation_steps=_robotwin_umi_observation_steps(),
+                observation_stride=_robotwin_umi_observation_stride(),
+                action_horizon=50,
+            ).to_dict(),
+            "asset_id": _robotwin_umi_asset_id(),
         },
         batch_size=64,
         fsdp_devices=1,
@@ -905,9 +997,7 @@ _CONFIGS = [
             # If your dataset uses cam_high instead of stereo_right, set:
             # base_image_key="observation.images.cam_high",
         ),
-        weight_loader=weight_loaders.PartialCheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
+        weight_loader=weight_loaders.PartialCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(

@@ -213,26 +213,35 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    def temporal_queries(fps: int) -> dict[str, list[float]]:
+        result = {key: [t / fps for t in range(action_horizon)] for key in data_config.action_sequence_keys}
+        overlap = set(result) & set(data_config.temporal_query_offsets)
+        if overlap:
+            raise ValueError(f"Temporal query keys overlap action sequence keys: {tuple(sorted(overlap))}")
+        result.update(
+            {
+                key: [int(offset) / fps for offset in offsets]
+                for key, offsets in data_config.temporal_query_offsets.items()
+            }
+        )
+        return result
+
     if is_lerobot_v21_dataset(data_config.dataset_root):
         dataset_meta = LeRobotV21Metadata(data_config.dataset_root)
+        _validate_feature_names(dataset_meta.features, data_config.expected_feature_names)
         dataset = LeRobotV21Dataset(
             data_config.dataset_root,
-            delta_timestamps={
-                key: [t / dataset_meta.fps for t in range(action_horizon)]
-                for key in data_config.action_sequence_keys
-            },
+            delta_timestamps=temporal_queries(dataset_meta.fps),
             camera_keys=data_config.camera_keys,
             video_backend=data_config.video_backend,
         )
     else:
         dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.dataset_root)
+        _validate_feature_names(dataset_meta.features, data_config.expected_feature_names)
         dataset = lerobot_dataset.LeRobotDataset(
             data_config.repo_id,
             root=data_config.dataset_root,
-            delta_timestamps={
-                key: [t / dataset_meta.fps for t in range(action_horizon)]
-                for key in data_config.action_sequence_keys
-            },
+            delta_timestamps=temporal_queries(dataset_meta.fps),
             video_backend=data_config.video_backend,
         )
         _select_camera_features(dataset, data_config.camera_keys)
@@ -244,6 +253,29 @@ def create_torch_dataset(
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
+
+
+def _validate_feature_names(
+    features: dict[str, dict[str, typing.Any]],
+    expected: typing.Mapping[str, Sequence[str]],
+) -> None:
+    """Reject datasets whose same-shaped fields carry another state semantic."""
+
+    for key, expected_names in expected.items():
+        if key not in features:
+            raise ValueError(f"Dataset is missing required feature {key!r}")
+        actual_names = features[key].get("names")
+        if (
+            isinstance(actual_names, Sequence)
+            and len(actual_names) == 1
+            and isinstance(actual_names[0], Sequence)
+            and not isinstance(actual_names[0], str)
+        ):
+            actual_names = actual_names[0]
+        if tuple(actual_names or ()) != tuple(expected_names):
+            raise ValueError(
+                f"Dataset feature {key!r} has incompatible names {actual_names!r}; expected {list(expected_names)!r}"
+            )
 
 
 def create_rlds_dataset(

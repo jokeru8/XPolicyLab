@@ -21,7 +21,7 @@ import numpy as np
 UMI_PROTOCOL = "umi_v1"
 UMI_STORAGE_REPRESENTATION = "umi_relative_se3_gripper_v1"
 UMI_CHUNK_REPRESENTATION = "umi_chunk_relative_se3_gripper_v1"
-UMI_STATE_REPRESENTATION = "episode_initial_relative_se3_gripper_v1"
+UMI_STATE_REPRESENTATION = "umi_current_relative_history_se3_gripper_v1"
 
 POSE_DIM = 7
 UMI_ARM_ACTION_DIM = 7
@@ -34,7 +34,9 @@ class UmiProtocolSpec:
     """Resolved configuration shared by UMI training and inference."""
 
     use_head_camera: bool = False
-    observation_steps: int = 1
+    use_proprioception: bool = True
+    observation_steps: int = 2
+    observation_stride: int = 3
     action_horizon: int = 50
     execute_steps: int = 1
     protocol: str = UMI_PROTOCOL
@@ -46,15 +48,21 @@ class UmiProtocolSpec:
         if self.protocol != UMI_PROTOCOL:
             raise ValueError(f"Unsupported UMI protocol: {self.protocol!r}")
         if self.state_representation != UMI_STATE_REPRESENTATION:
-            raise ValueError(f"Unsupported UMI state representation: {self.state_representation!r}")
+            raise ValueError(
+                f"Unsupported UMI state representation: {self.state_representation!r}"
+            )
         if self.storage_action_representation != UMI_STORAGE_REPRESENTATION:
             raise ValueError(
                 f"Unsupported UMI storage action representation: {self.storage_action_representation!r}"
             )
         if self.model_action_representation != UMI_CHUNK_REPRESENTATION:
-            raise ValueError(f"Unsupported UMI model action representation: {self.model_action_representation!r}")
+            raise ValueError(
+                f"Unsupported UMI model action representation: {self.model_action_representation!r}"
+            )
         if self.observation_steps < 1:
             raise ValueError("observation_steps must be positive")
+        if self.observation_stride < 1:
+            raise ValueError("observation_stride must be positive")
         if self.action_horizon < 1:
             raise ValueError("action_horizon must be positive")
         if not 1 <= self.execute_steps <= self.action_horizon:
@@ -74,7 +82,9 @@ class UmiProtocolSpec:
         return result
 
     @classmethod
-    def from_mapping(cls, config: Mapping[str, Any], *, action_horizon: int | None = None) -> "UmiProtocolSpec":
+    def from_mapping(
+        cls, config: Mapping[str, Any], *, action_horizon: int | None = None
+    ) -> "UmiProtocolSpec":
         observation = config.get("observation", {})
         temporal = config.get("temporal", {})
         execution = config.get("execution", {})
@@ -92,13 +102,30 @@ class UmiProtocolSpec:
         )
         return cls(
             use_head_camera=_as_bool(
-                config.get("use_head_camera", observation.get("use_head_camera", False)),
+                config.get(
+                    "use_head_camera", observation.get("use_head_camera", False)
+                ),
                 name="use_head_camera",
             ),
-            observation_steps=int(config.get("observation_steps", temporal.get("observation_steps", 1))),
+            use_proprioception=_as_bool(
+                config.get(
+                    "use_proprioception", observation.get("use_proprioception", True)
+                ),
+                name="use_proprioception",
+            ),
+            observation_steps=int(
+                config.get("observation_steps", temporal.get("observation_steps", 2))
+            ),
+            observation_stride=int(
+                config.get("observation_stride", temporal.get("observation_stride", 3))
+            ),
             action_horizon=resolved_horizon,
-            execute_steps=int(config.get("execute_steps", execution.get("execute_steps", 1))),
-            protocol=str(config.get("action_protocol", config.get("umi_protocol", UMI_PROTOCOL))),
+            execute_steps=int(
+                config.get("execute_steps", execution.get("execute_steps", 1))
+            ),
+            protocol=str(
+                config.get("action_protocol", config.get("umi_protocol", UMI_PROTOCOL))
+            ),
         )
 
 
@@ -129,7 +156,11 @@ def rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
     if theta < 1e-12:
         return np.eye(3, dtype=np.float64) + _skew(rotvec)
     axis_skew = _skew(rotvec / theta)
-    return np.eye(3) + np.sin(theta) * axis_skew + (1.0 - np.cos(theta)) * (axis_skew @ axis_skew)
+    return (
+        np.eye(3)
+        + np.sin(theta) * axis_skew
+        + (1.0 - np.cos(theta)) * (axis_skew @ axis_skew)
+    )
 
 
 def matrix_to_rotvec(rotation: np.ndarray) -> np.ndarray:
@@ -140,7 +171,11 @@ def matrix_to_rotvec(rotation: np.ndarray) -> np.ndarray:
     theta = float(np.arccos(cosine))
     if theta < 1e-8:
         return 0.5 * np.array(
-            [rotation[2, 1] - rotation[1, 2], rotation[0, 2] - rotation[2, 0], rotation[1, 0] - rotation[0, 1]]
+            [
+                rotation[2, 1] - rotation[1, 2],
+                rotation[0, 2] - rotation[2, 0],
+                rotation[1, 0] - rotation[0, 1],
+            ]
         )
     if np.pi - theta < 1e-6:
         diagonal = np.maximum((np.diag(rotation) + 1.0) / 2.0, 0.0)
@@ -161,7 +196,11 @@ def matrix_to_rotvec(rotation: np.ndarray) -> np.ndarray:
             raise ValueError("cannot recover rotation axis from matrix")
         return theta * axis / norm
     vector = np.array(
-        [rotation[2, 1] - rotation[1, 2], rotation[0, 2] - rotation[2, 0], rotation[1, 0] - rotation[0, 1]]
+        [
+            rotation[2, 1] - rotation[1, 2],
+            rotation[0, 2] - rotation[2, 0],
+            rotation[1, 0] - rotation[0, 1],
+        ]
     )
     return theta * vector / (2.0 * np.sin(theta))
 
@@ -202,7 +241,9 @@ def matrix_to_quaternion_wxyz(rotation: np.ndarray) -> np.ndarray:
     else:
         largest = int(np.argmax(np.diag(rotation)))
         if largest == 0:
-            scale = 2.0 * np.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2])
+            scale = 2.0 * np.sqrt(
+                1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]
+            )
             quaternion = np.array(
                 [
                     (rotation[2, 1] - rotation[1, 2]) / scale,
@@ -212,7 +253,9 @@ def matrix_to_quaternion_wxyz(rotation: np.ndarray) -> np.ndarray:
                 ]
             )
         elif largest == 1:
-            scale = 2.0 * np.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2])
+            scale = 2.0 * np.sqrt(
+                1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]
+            )
             quaternion = np.array(
                 [
                     (rotation[0, 2] - rotation[2, 0]) / scale,
@@ -222,7 +265,9 @@ def matrix_to_quaternion_wxyz(rotation: np.ndarray) -> np.ndarray:
                 ]
             )
         else:
-            scale = 2.0 * np.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1])
+            scale = 2.0 * np.sqrt(
+                1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]
+            )
             quaternion = np.array(
                 [
                     (rotation[1, 0] - rotation[0, 1]) / scale,
@@ -254,7 +299,9 @@ def matrix_to_pose(matrix: np.ndarray) -> np.ndarray:
 def relative_action_to_matrix(action: np.ndarray) -> np.ndarray:
     action = np.asarray(action, dtype=np.float64)
     if action.shape != (6,):
-        raise ValueError(f"relative pose action must have shape (6,), got {action.shape}")
+        raise ValueError(
+            f"relative pose action must have shape (6,), got {action.shape}"
+        )
     result = np.eye(4, dtype=np.float64)
     result[:3, 3] = action[:3]
     result[:3, :3] = rotvec_to_matrix(action[3:])
@@ -264,11 +311,15 @@ def relative_action_to_matrix(action: np.ndarray) -> np.ndarray:
 def matrix_to_relative_action(matrix: np.ndarray) -> np.ndarray:
     matrix = np.asarray(matrix, dtype=np.float64)
     if matrix.shape != (4, 4):
-        raise ValueError(f"relative transform must have shape (4, 4), got {matrix.shape}")
+        raise ValueError(
+            f"relative transform must have shape (4, 4), got {matrix.shape}"
+        )
     return np.concatenate((matrix[:3, 3], matrix_to_rotvec(matrix[:3, :3])))
 
 
-def pose_relative_to_reference(pose: np.ndarray, reference_pose: np.ndarray) -> np.ndarray:
+def pose_relative_to_reference(
+    pose: np.ndarray, reference_pose: np.ndarray
+) -> np.ndarray:
     """Encode ``reference_pose^-1 * pose`` as ``xyz + rotvec``.
 
     RoboTwin poses are ``[x, y, z, qw, qx, qy, qz]``.  The returned translation
@@ -298,7 +349,9 @@ def bimanual_episode_relative_ee_state(
     def _poses(value: np.ndarray, name: str) -> np.ndarray:
         result = np.asarray(value, dtype=np.float64)
         if result.ndim != 2 or result.shape[1] != POSE_DIM:
-            raise ValueError(f"{name} must have shape (T, {POSE_DIM}), got {result.shape}")
+            raise ValueError(
+                f"{name} must have shape (T, {POSE_DIM}), got {result.shape}"
+            )
         if result.shape[0] == 0:
             raise ValueError(f"{name} must contain at least one frame")
         if not np.all(np.isfinite(result)):
@@ -310,7 +363,9 @@ def bimanual_episode_relative_ee_state(
         if result.ndim == 2 and result.shape[1] == 1:
             result = result[:, 0]
         if result.ndim != 1 or result.shape[0] != horizon:
-            raise ValueError(f"{name} must have shape (T,) or (T, 1), got {result.shape}")
+            raise ValueError(
+                f"{name} must have shape (T,) or (T, 1), got {result.shape}"
+            )
         if not np.all(np.isfinite(result)):
             raise ValueError(f"{name} must contain only finite values")
         return result
@@ -330,9 +385,13 @@ def bimanual_episode_relative_ee_state(
     left_reference = left_poses[0]
     right_reference = right_poses[0]
     for index in range(horizon):
-        result[index, :6] = pose_relative_to_reference(left_poses[index], left_reference)
+        result[index, :6] = pose_relative_to_reference(
+            left_poses[index], left_reference
+        )
         result[index, 6] = left_grippers[index]
-        result[index, 7:13] = pose_relative_to_reference(right_poses[index], right_reference)
+        result[index, 7:13] = pose_relative_to_reference(
+            right_poses[index], right_reference
+        )
         result[index, 13] = right_grippers[index]
 
     # Exact zero at the reference frame is a useful data invariant and avoids
@@ -340,6 +399,57 @@ def bimanual_episode_relative_ee_state(
     result[0, :6] = 0.0
     result[0, 7:13] = 0.0
     return result
+
+
+def rebase_episode_relative_state_history(state_history: np.ndarray) -> np.ndarray:
+    """Rebase episode-relative EEF states to the latest observation.
+
+    The stored 14-D rows use ``T_0^-1 T_i`` for each arm.  UMI proprioception
+    instead expresses every historical pose in the latest EEF frame, so this
+    function computes ``(T_0^-1 T_t)^-1 (T_0^-1 T_i) = T_t^-1 T_i``.  Gripper
+    values remain absolute.  The input may have arbitrary batch dimensions and
+    must end in ``(observation_steps, 14)``.
+    """
+
+    history = np.asarray(state_history)
+    if history.ndim < 2 or history.shape[-1] != UMI_BIMANUAL_ACTION_DIM:
+        raise ValueError(
+            "state_history must have shape (..., observation_steps, "
+            f"{UMI_BIMANUAL_ACTION_DIM}), got {history.shape}"
+        )
+    if history.shape[-2] < 1:
+        raise ValueError("state_history must contain at least one observation")
+    if not np.all(np.isfinite(history)):
+        raise ValueError("state_history must contain only finite values")
+
+    observation_steps = history.shape[-2]
+    batch_shape = history.shape[:-2]
+    flat_history = history.reshape(
+        (-1, observation_steps, UMI_BIMANUAL_ACTION_DIM)
+    ).astype(np.float64, copy=False)
+    result = np.empty_like(flat_history)
+    for batch_index, sample in enumerate(flat_history):
+        for arm_offset in (0, UMI_ARM_ACTION_DIM):
+            latest = relative_action_to_matrix(sample[-1, arm_offset : arm_offset + 6])
+            latest_inverse = np.linalg.inv(latest)
+            for time_index in range(observation_steps):
+                pose = relative_action_to_matrix(
+                    sample[time_index, arm_offset : arm_offset + 6]
+                )
+                result[batch_index, time_index, arm_offset : arm_offset + 6] = (
+                    matrix_to_relative_action(latest_inverse @ pose)
+                )
+                result[batch_index, time_index, arm_offset + 6] = sample[
+                    time_index, arm_offset + 6
+                ]
+
+            # Preserve an exact identity for the latest pose.  This avoids tiny
+            # numerical residue becoming a spurious proprioceptive signal.
+            result[batch_index, -1, arm_offset : arm_offset + 6] = 0.0
+
+    output = result.reshape((*batch_shape, observation_steps, UMI_BIMANUAL_ACTION_DIM))
+    dtype = history.dtype if np.issubdtype(history.dtype, np.floating) else np.float32
+    return output.astype(dtype)
 
 
 def bimanual_relative_ee_state_from_reference(
@@ -391,7 +501,9 @@ def adjacent_actions_to_episode_relative_ee_state(
         if result.ndim == 2 and result.shape[1] == 1:
             result = result[:, 0]
         if result.ndim != 1 or result.shape[0] != horizon:
-            raise ValueError(f"{name} must have shape (T,) or (T, 1), got {result.shape}")
+            raise ValueError(
+                f"{name} must have shape (T,) or (T, 1), got {result.shape}"
+            )
         if not np.all(np.isfinite(result)):
             raise ValueError(f"{name} must contain only finite values")
         return result
@@ -402,8 +514,12 @@ def adjacent_actions_to_episode_relative_ee_state(
     cumulative = [np.eye(4, dtype=np.float64), np.eye(4, dtype=np.float64)]
     for index, action in enumerate(actions):
         for arm_index, offset in enumerate((0, UMI_ARM_ACTION_DIM)):
-            result[index, offset : offset + 6] = matrix_to_relative_action(cumulative[arm_index])
-            cumulative[arm_index] = cumulative[arm_index] @ relative_action_to_matrix(action[offset : offset + 6])
+            result[index, offset : offset + 6] = matrix_to_relative_action(
+                cumulative[arm_index]
+            )
+            cumulative[arm_index] = cumulative[arm_index] @ relative_action_to_matrix(
+                action[offset : offset + 6]
+            )
         result[index, 6] = left_grippers[index]
         result[index, 13] = right_grippers[index]
     return result
@@ -430,18 +546,24 @@ def adjacent_actions_to_chunk_targets(
 
     horizon = actions.shape[-2]
     batch_shape = actions.shape[:-2]
-    flat_actions = actions.reshape((-1, horizon, UMI_BIMANUAL_ACTION_DIM)).astype(np.float64, copy=False)
+    flat_actions = actions.reshape((-1, horizon, UMI_BIMANUAL_ACTION_DIM)).astype(
+        np.float64, copy=False
+    )
     if action_is_pad is None:
         flat_pad = np.zeros((flat_actions.shape[0], horizon), dtype=bool)
     else:
         pad = np.asarray(action_is_pad, dtype=bool)
         if pad.shape != (*batch_shape, horizon):
-            raise ValueError(f"action_is_pad must have shape {(*batch_shape, horizon)}, got {pad.shape}")
+            raise ValueError(
+                f"action_is_pad must have shape {(*batch_shape, horizon)}, got {pad.shape}"
+            )
         flat_pad = pad.reshape((-1, horizon))
 
     result = np.empty_like(flat_actions, dtype=np.float64)
     arm_offsets = (0, UMI_ARM_ACTION_DIM)
-    for batch_index, (sample, sample_pad) in enumerate(zip(flat_actions, flat_pad, strict=True)):
+    for batch_index, (sample, sample_pad) in enumerate(
+        zip(flat_actions, flat_pad, strict=True)
+    ):
         if np.any(sample_pad[:-1] & ~sample_pad[1:]):
             raise ValueError("action padding must be trailing within each chunk")
         cumulative = [np.eye(4, dtype=np.float64), np.eye(4, dtype=np.float64)]
@@ -449,16 +571,20 @@ def adjacent_actions_to_chunk_targets(
         for time_index in range(horizon):
             for arm_index, offset in enumerate(arm_offsets):
                 if not sample_pad[time_index]:
-                    cumulative[arm_index] = cumulative[arm_index] @ relative_action_to_matrix(
+                    cumulative[arm_index] = cumulative[
+                        arm_index
+                    ] @ relative_action_to_matrix(
                         sample[time_index, offset : offset + 6]
                     )
                     latest_gripper[arm_index] = float(sample[time_index, offset + 6])
-                result[batch_index, time_index, offset : offset + 6] = matrix_to_relative_action(
-                    cumulative[arm_index]
+                result[batch_index, time_index, offset : offset + 6] = (
+                    matrix_to_relative_action(cumulative[arm_index])
                 )
                 result[batch_index, time_index, offset + 6] = latest_gripper[arm_index]
 
-    return result.reshape(actions.shape).astype(actions.dtype if np.issubdtype(actions.dtype, np.floating) else np.float32)
+    return result.reshape(actions.shape).astype(
+        actions.dtype if np.issubdtype(actions.dtype, np.floating) else np.float32
+    )
 
 
 def chunk_targets_to_ee_actions(
@@ -473,24 +599,39 @@ def chunk_targets_to_ee_actions(
     if squeeze:
         chunk = chunk[None, :]
     if chunk.ndim != 2 or chunk.shape[1] != UMI_BIMANUAL_ACTION_DIM:
-        raise ValueError(f"chunk_actions must have shape (H, 14) or (14,), got {chunk_actions.shape}")
+        raise ValueError(
+            f"chunk_actions must have shape (H, 14) or (14,), got {chunk_actions.shape}"
+        )
     if not np.all(np.isfinite(chunk)):
         raise ValueError("chunk_actions must contain only finite values")
 
-    references = (pose_to_matrix(left_reference_pose), pose_to_matrix(right_reference_pose))
-    output = np.empty((chunk.shape[0], ROBOTWIN_BIMANUAL_EE_ACTION_DIM), dtype=np.float64)
+    references = (
+        pose_to_matrix(left_reference_pose),
+        pose_to_matrix(right_reference_pose),
+    )
+    output = np.empty(
+        (chunk.shape[0], ROBOTWIN_BIMANUAL_EE_ACTION_DIM), dtype=np.float64
+    )
     for time_index, action in enumerate(chunk):
         output_offset = 0
         for arm_index, input_offset in enumerate((0, UMI_ARM_ACTION_DIM)):
-            target = references[arm_index] @ relative_action_to_matrix(action[input_offset : input_offset + 6])
-            output[time_index, output_offset : output_offset + POSE_DIM] = matrix_to_pose(target)
-            output[time_index, output_offset + POSE_DIM] = np.clip(action[input_offset + 6], 0.0, 1.0)
+            target = references[arm_index] @ relative_action_to_matrix(
+                action[input_offset : input_offset + 6]
+            )
+            output[time_index, output_offset : output_offset + POSE_DIM] = (
+                matrix_to_pose(target)
+            )
+            output[time_index, output_offset + POSE_DIM] = np.clip(
+                action[input_offset + 6], 0.0, 1.0
+            )
             output_offset += POSE_DIM + 1
     output = output.astype(np.float32)
     return output[0] if squeeze else output
 
 
-def chunk_targets_to_action_dicts(chunk_actions: np.ndarray) -> list[dict[str, np.ndarray]]:
+def chunk_targets_to_action_dicts(
+    chunk_actions: np.ndarray,
+) -> list[dict[str, np.ndarray]]:
     """Convert a numeric chunk into XPolicyLab's bimanual UMI action dictionaries."""
 
     chunk = np.asarray(chunk_actions, dtype=np.float32)

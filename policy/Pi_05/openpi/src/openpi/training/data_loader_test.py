@@ -31,6 +31,19 @@ def test_full_action_horizon_requires_a_long_enough_episode():
         _data_loader._full_action_horizon_indices(dataset, 2)  # noqa: SLF001
 
 
+def test_feature_name_validation_rejects_same_shape_with_wrong_semantics():
+    expected = {"observation.state": ("left_rel_x", "left_gripper")}
+    _data_loader._validate_feature_names(  # noqa: SLF001
+        {"observation.state": {"names": [["left_rel_x", "left_gripper"]]}},
+        expected,
+    )
+    with pytest.raises(ValueError, match="incompatible names"):
+        _data_loader._validate_feature_names(  # noqa: SLF001
+            {"observation.state": {"names": [["left_joint_0", "left_joint_1"]]}},
+            expected,
+        )
+
+
 def test_torch_data_loader():
     config = pi0_config.Pi0Config(action_dim=24, action_horizon=50, max_token_len=48)
     dataset = _data_loader.FakeDataset(config, 16)

@@ -21,7 +21,7 @@ If uv cannot fetch the Python version in `.python-version`, select an already in
 
 Converts RoboDojo demonstrations into the LeRobot repo consumed by training. The dataset uses the official keys — `observation.state`, `action`, `observation.images.cam_high` / `cam_left_wrist` / `cam_right_wrist` ([official LeRobot conversion](../../README.md#official-lerobot-conversion)); the bundled script exists because conversion must run inside openpi's own pinned LeRobot environment, which sets the dataset version. The optional `expert_data_num` caps episodes for data conversion only (it is not part of checkpoint naming); the optional `raw_task_dirs` is a source task directory or comma-separated task list under `data/<bench_name>/` (defaults to `ckpt_name`). `raw_task_dirs` may also be passed directly as the 5th argument to write a differently named dataset from all of a task's demos, e.g. `bash process_data.sh RoboDojo stack_bowls_ablation arx_x5 joint stack_bowls`.
 
-RoboTwin-UMI uses the prepared LeRobot v2.1 export directly. OpenPI remains pinned to LeRobot 0.4.4; a local, read-only compatibility reader handles the v2.1 parquet/video layout without rewriting the dataset. The keys match the official XPolicyLab v2.1 converter, `scripts/transform_lerobot_v21_format.py`, with `action_type=umi`. `observation.state` is 14-D: per arm, EEF pose relative to that episode's first frame (`xyz + rotvec`) followed by the absolute gripper value. The `action` field is 14-D bimanual adjacent-frame local SE(3) motion plus absolute grippers, converted after temporal sampling into a fixed-reference UMI action chunk before normalization.
+RoboTwin-UMI uses the prepared LeRobot v2.1 export directly. OpenPI remains pinned to LeRobot 0.4.4; a local, read-only compatibility reader handles the v2.1 parquet/video layout without rewriting the dataset. The keys match the official XPolicyLab v2.1 converter, `scripts/transform_lerobot_v21_format.py`, with `action_type=umi`. Stored `observation.state` is 14-D: per arm, EEF pose relative to that episode's first frame (`xyz + rotvec`) followed by the absolute gripper value. The loader samples `(t-3, t)` and rebases both poses to frame `t`, producing a flattened 28-D model state; grippers remain absolute. The `action` field is 14-D bimanual adjacent-frame local SE(3) motion plus absolute grippers, converted after temporal sampling into a fixed-reference UMI action chunk before normalization.
 
 ```bash
 cd XPolicyLab/policy/Pi_05
@@ -34,7 +34,7 @@ bash process_data.sh RoboDojo stack_bowls arx_x5 joint
 bash process_data.sh RoboDojo stack_bowls_50ep arx_x5 joint 50 stack_bowls
 
 # UMI: validate and reuse the prepared v2.1 dataset (no conversion or overwrite)
-ROBOTWIN_UMI_DATASET=/research_haidong_kpfs/zhoukr/datasets/robotwin_umi \
+ROBOTWIN_UMI_DATASET=/research_haidong_kpfs/zhoukr/datasets/robotwin_umi_eef_rel \
   bash process_data.sh RoboTwin robotwin_umi aloha_agilex umi
 ```
 
@@ -49,23 +49,29 @@ bash train.sh RoboDojo cotrain arx_x5 joint 0 0
 
 # UMI wrist-only: first compute stats, then train
 cd openpi
-ROBOTWIN_UMI_DATASET=/research_haidong_kpfs/zhoukr/datasets/robotwin_umi \
+ROBOTWIN_UMI_DATASET=/research_haidong_kpfs/zhoukr/datasets/robotwin_umi_eef_rel \
 OPENPI_USE_HEAD_CAMERA=false \
+OPENPI_USE_PROPRIOCEPTION=true \
+OPENPI_UMI_OBSERVATION_STEPS=2 \
+OPENPI_UMI_OBSERVATION_STRIDE=3 \
   .venv/bin/python scripts/compute_norm_stats.py --config-name pi05_robotwin_umi
 cd ..
-ROBOTWIN_UMI_DATASET=/research_haidong_kpfs/zhoukr/datasets/robotwin_umi \
+ROBOTWIN_UMI_DATASET=/research_haidong_kpfs/zhoukr/datasets/robotwin_umi_eef_rel \
 OPENPI_USE_HEAD_CAMERA=false \
+OPENPI_USE_PROPRIOCEPTION=true \
+OPENPI_UMI_OBSERVATION_STEPS=2 \
+OPENPI_UMI_OBSERVATION_STRIDE=3 \
   bash train.sh RoboTwin robotwin_umi aloha_agilex umi 0 0
 
 # UMI head + dual wrist: use true for both stats and training
-ROBOTWIN_UMI_DATASET=/research_haidong_kpfs/zhoukr/datasets/robotwin_umi \
+ROBOTWIN_UMI_DATASET=/research_haidong_kpfs/zhoukr/datasets/robotwin_umi_eef_rel \
 OPENPI_USE_HEAD_CAMERA=true \
   bash train.sh RoboTwin robotwin_umi_head aloha_agilex umi 0 0
 ```
 
 Checkpoints land in `checkpoints/<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>-<seed>/`; at eval time `ckpt_name` may be the short run name (auto-combined into that directory name), the full run-directory name, or a path to a checkpoint directory. By default training reads the LeRobot repo produced by `process_data.sh` (`<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>`); override with `OPENPI_LEROBOT_REPO_ID` when reusing an existing dataset. `train.sh` sets `fsdp_devices=1` for one visible GPU and `2` for multi-GPU by default (override with `OPENPI_FSDP_DEVICES`).
 
-For UMI, the default config is `pi05_robotwin_umi`, with action horizon 50, one observation step, and `execute_steps=1`. Frames whose full action horizon would cross an episode boundary are excluded. Normalization reads only state/action parquet fields and does not decode video; both camera modes share the same numeric statistics. Every saved UMI checkpoint contains `assets/umi_spec.json`; inference rejects mismatched camera mode, horizon, action protocol, or state representation. Checkpoints trained with the earlier `joint_gripper` state export are intentionally incompatible and must be retrained.
+For UMI, the default training config is `pi05_robotwin_umi`, with action horizon 50 and two state observations at frame stride 3. The Pi 0.5 deployment configuration executes all 50 targets from each predicted chunk (`execute_steps=50`) before replanning. This execution cadence is an inference choice rather than a checkpoint-compatibility field; targets in the chunk retain their common observation-time reference frame. Frames whose full action horizon would cross an episode boundary are excluded. At episode startup, unavailable history repeats the earliest frame. Normalization reads only state/action parquet fields and does not decode video. Camera modes share numeric statistics, but proprioception-on and camera-only runs use distinct asset ids and statistics. Every saved UMI checkpoint contains `assets/umi_spec.json`; inference rejects mismatched camera mode, proprioception mode, temporal settings, horizon, action protocol, or state representation. Earlier UMI checkpoints use a different state contract and must be retrained.
 
 ## Evaluation
 
@@ -85,13 +91,14 @@ bash eval.sh RoboTwin <task_name> robotwin_umi aloha_agilex umi 0 0 0 uv <eval_e
 
 ## Configuration
 
-`deploy.yml` keys to check before evaluation: `checkpoint_num`, `result_dir`, `obs_transform_pipeline`, `policy_uv_env_path`, `train_config_name` (must match the config used by `train.sh`), `repo_id`. UMI additionally uses `action_protocol`, `use_head_camera`, `observation_steps`, and `execute_steps`. `execute_steps` defaults to 1; if increased, all targets in a predicted chunk remain relative to the observation that initiated that prediction request.
+`deploy.yml` keys to check before evaluation: `checkpoint_num`, `result_dir`, `obs_transform_pipeline`, `policy_uv_env_path`, `train_config_name` (must match the config used by `train.sh`), `repo_id`. UMI additionally uses `action_protocol`, `use_head_camera`, `use_proprioception`, `observation_steps`, `observation_stride`, and `execute_steps`. The supplied Pi 0.5 deployment uses `execute_steps=50`; all targets in a predicted chunk remain relative to the observation that initiated that prediction request.
 
 Environment variables used by the adapter scripts:
 
 | Variable | Notes |
 |---|---|
-| `OPENPI_LEROBOT_REPO_ID` | Overrides the LeRobot repo/normalization asset id. UMI defaults to `robotwin_umi`; legacy modes use `<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>`. |
+| `OPENPI_LEROBOT_REPO_ID` | Overrides the LeRobot repo id. UMI defaults to `robotwin_umi`; legacy modes use `<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>`. |
+| `OPENPI_UMI_ASSET_ID` | Optional explicit normalization asset id. By default it is derived from repo id, proprioception mode, observation steps, and stride. |
 | `OPENPI_FSDP_DEVICES` | Overrides the FSDP device count passed to OpenPI training. |
 | `OPENPI_TRAIN_CONFIG_NAME` | Overrides the training config; defaults to `pi05_base_aloha_full_sim_arx-x5_seed_0`. |
 | `OPENPI_DATA_MODE` | Data-processing mode passed to `openpi/scripts/process_data.py`; defaults to `image`. |
@@ -99,6 +106,9 @@ Environment variables used by the adapter scripts:
 | `OPENPI_PYTHON` | Optional Python executable passed to `uv sync` during installation. |
 | `ROBOTWIN_UMI_DATASET` | Required local root of the prepared LeRobot v2.1 dataset for UMI training/statistics. |
 | `OPENPI_USE_HEAD_CAMERA` | UMI training camera mode: `false` for dual wrist (default), `true` for head plus dual wrist. |
+| `OPENPI_USE_PROPRIOCEPTION` | `true` (default) uses short EEF history; `false` supplies an exact zero state after normalization for a camera-only model. |
+| `OPENPI_UMI_OBSERVATION_STEPS` | Number of sampled UMI state observations; defaults to 2. π0.5's 32-D state slot currently limits the 14-D bimanual encoding to at most two steps. |
+| `OPENPI_UMI_OBSERVATION_STRIDE` | Frame interval between the two UMI state observations; defaults to 3. |
 
 `OPENPI_ROOT` and `OPENPI_SRC` are additional overrides consumed by the local scripts.
 
