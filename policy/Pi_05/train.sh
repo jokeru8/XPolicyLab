@@ -20,18 +20,6 @@ ckpt_dir="${POLICY_DIR}/checkpoints/${ckpt_setting}"
 if [[ "${action_type}" == "umi" ]]; then
   train_config_name="${OPENPI_TRAIN_CONFIG_NAME:-pi05_robotwin_umi}"
   : "${ROBOTWIN_UMI_DATASET:?Set ROBOTWIN_UMI_DATASET to the prepared LeRobot v2.1 dataset root}"
-  case "${OPENPI_USE_HEAD_CAMERA:-false}" in
-    1|true|TRUE|yes|YES|on|ON)
-      export OPENPI_USE_HEAD_CAMERA=true
-      ;;
-    0|false|FALSE|no|NO|off|OFF)
-      export OPENPI_USE_HEAD_CAMERA=false
-      ;;
-    *)
-      echo "[Pi_05][ERROR] OPENPI_USE_HEAD_CAMERA must be a boolean" >&2
-      exit 1
-      ;;
-  esac
   lerobot_repo_id="${OPENPI_LEROBOT_REPO_ID:-robotwin_umi}"
 else
   train_config_name="${OPENPI_TRAIN_CONFIG_NAME:-pi05_base_aloha_full_sim_arx-x5_seed_0}"
@@ -55,7 +43,10 @@ echo "[Pi_05] train_config_name=${train_config_name}"
 echo "[Pi_05] lerobot_repo_id=${lerobot_repo_id}"
 if [[ "${action_type}" == "umi" ]]; then
   echo "[Pi_05] robotwin_umi_dataset=${ROBOTWIN_UMI_DATASET}"
-  echo "[Pi_05] use_head_camera=${OPENPI_USE_HEAD_CAMERA}"
+  echo "[Pi_05] UMI observation settings come from ${POLICY_DIR}/deploy.yml"
+  if [[ -n "${OPENPI_USE_HEAD_CAMERA+x}" ]]; then
+    echo "[Pi_05] OPENPI_USE_HEAD_CAMERA overrides deploy.yml: ${OPENPI_USE_HEAD_CAMERA}"
+  fi
 fi
 echo "[Pi_05] fsdp_devices=${fsdp_devices}"
 echo "[Pi_05] local_cache_root=${LOCAL_CACHE_ROOT}"

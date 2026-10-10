@@ -47,26 +47,14 @@ bash train.sh <bench_name> <ckpt_name> <env_cfg_type> <action_type> <seed> <gpu_
 # Example: train a cotrain run on GPU 0 (comma-separated gpu_id for multi-GPU)
 bash train.sh RoboDojo cotrain arx_x5 joint 0 0
 
-# UMI wrist-only: first compute stats, then train
+# UMI: first set use_head_camera and the other observation fields in deploy.yml,
+# then compute stats and train with that same configuration
 cd openpi
 ROBOTWIN_UMI_DATASET=/research_haidong_kpfs/zhoukr/datasets/robotwin_umi_eef_rel \
-OPENPI_USE_HEAD_CAMERA=false \
-OPENPI_USE_PROPRIOCEPTION=true \
-OPENPI_UMI_OBSERVATION_STEPS=2 \
-OPENPI_UMI_OBSERVATION_STRIDE=3 \
   .venv/bin/python scripts/compute_norm_stats.py --config-name pi05_robotwin_umi
 cd ..
 ROBOTWIN_UMI_DATASET=/research_haidong_kpfs/zhoukr/datasets/robotwin_umi_eef_rel \
-OPENPI_USE_HEAD_CAMERA=false \
-OPENPI_USE_PROPRIOCEPTION=true \
-OPENPI_UMI_OBSERVATION_STEPS=2 \
-OPENPI_UMI_OBSERVATION_STRIDE=3 \
   bash train.sh RoboTwin robotwin_umi aloha_agilex umi 0 0
-
-# UMI head + dual wrist: use true for both stats and training
-ROBOTWIN_UMI_DATASET=/research_haidong_kpfs/zhoukr/datasets/robotwin_umi_eef_rel \
-OPENPI_USE_HEAD_CAMERA=true \
-  bash train.sh RoboTwin robotwin_umi_head aloha_agilex umi 0 0
 ```
 
 Checkpoints land in `checkpoints/<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>-<seed>/`; at eval time `ckpt_name` may be the short run name (auto-combined into that directory name), the full run-directory name, or a path to a checkpoint directory. By default training reads the LeRobot repo produced by `process_data.sh` (`<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>`); override with `OPENPI_LEROBOT_REPO_ID` when reusing an existing dataset. `train.sh` sets `fsdp_devices=1` for one visible GPU and `2` for multi-GPU by default (override with `OPENPI_FSDP_DEVICES`).
@@ -91,7 +79,7 @@ bash eval.sh RoboTwin <task_name> robotwin_umi aloha_agilex umi 0 0 0 uv <eval_e
 
 ## Configuration
 
-`deploy.yml` keys to check before evaluation: `checkpoint_num`, `result_dir`, `obs_transform_pipeline`, `policy_uv_env_path`, `train_config_name` (must match the config used by `train.sh`), `repo_id`. UMI additionally uses `action_protocol`, `use_head_camera`, `use_proprioception`, `observation_steps`, `observation_stride`, and `execute_steps`. The supplied Pi 0.5 deployment uses `execute_steps=50`; all targets in a predicted chunk remain relative to the observation that initiated that prediction request.
+`deploy.yml` keys to check before evaluation: `checkpoint_num`, `result_dir`, `obs_transform_pipeline`, `policy_uv_env_path`, `train_config_name` (must match the config used by `train.sh`), `repo_id`. For UMI, `use_head_camera`, `use_proprioception`, `observation_steps`, and `observation_stride` are shared by normalization-stat computation, training, and inference. Set `use_head_camera: false` for dual wrist only, or `true` for head plus dual wrist, before computing statistics and training. `action_protocol` and `execute_steps` are inference settings; the supplied deployment uses `execute_steps=50`, and all targets in a predicted chunk remain relative to the observation that initiated that prediction request.
 
 Environment variables used by the adapter scripts:
 
@@ -105,10 +93,11 @@ Environment variables used by the adapter scripts:
 | `OPENPI_LOCAL_CACHE_ROOT` | Per-host local cache root for the HF datasets / JAX compilation caches; defaults to `/tmp/openpi-cache-$(hostname)`. |
 | `OPENPI_PYTHON` | Optional Python executable passed to `uv sync` during installation. |
 | `ROBOTWIN_UMI_DATASET` | Required local root of the prepared LeRobot v2.1 dataset for UMI training/statistics. |
-| `OPENPI_USE_HEAD_CAMERA` | UMI training camera mode: `false` for dual wrist (default), `true` for head plus dual wrist. |
-| `OPENPI_USE_PROPRIOCEPTION` | `true` (default) uses short EEF history; `false` supplies an exact zero state after normalization for a camera-only model. |
-| `OPENPI_UMI_OBSERVATION_STEPS` | Number of sampled UMI state observations; defaults to 2. π0.5's 32-D state slot currently limits the 14-D bimanual encoding to at most two steps. |
-| `OPENPI_UMI_OBSERVATION_STRIDE` | Frame interval between the two UMI state observations; defaults to 3. |
+| `OPENPI_DEPLOY_CONFIG` | Optional path to an alternate Pi_05 YAML for normalization/training. Defaults to this adapter's `deploy.yml`. |
+| `OPENPI_USE_HEAD_CAMERA` | Optional temporary override for YAML `use_head_camera`. Normally configure the YAML directly. |
+| `OPENPI_USE_PROPRIOCEPTION` | Optional temporary override for YAML `use_proprioception`. |
+| `OPENPI_UMI_OBSERVATION_STEPS` | Optional temporary override for YAML `observation_steps`; π0.5's 32-D state slot currently limits the 14-D bimanual encoding to at most two steps. |
+| `OPENPI_UMI_OBSERVATION_STRIDE` | Optional temporary override for YAML `observation_stride`. |
 
 `OPENPI_ROOT` and `OPENPI_SRC` are additional overrides consumed by the local scripts.
 

@@ -28,6 +28,7 @@ import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.optimizer as _optimizer
+import openpi.training.robotwin_umi_config as robotwin_umi_config
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 
@@ -43,39 +44,19 @@ def _robotwin_umi_dataset_root() -> str | None:
 
 
 def _robotwin_umi_use_head_camera() -> bool:
-    value = os.environ.get("OPENPI_USE_HEAD_CAMERA", "false").strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"OPENPI_USE_HEAD_CAMERA must be a boolean, got {value!r}")
-
-
-def _environment_bool(name: str, *, default: bool) -> bool:
-    value = os.environ.get(name, str(default)).strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return robotwin_umi_config.use_head_camera()
 
 
 def _robotwin_umi_use_proprioception() -> bool:
-    return _environment_bool("OPENPI_USE_PROPRIOCEPTION", default=True)
+    return robotwin_umi_config.use_proprioception()
 
 
 def _robotwin_umi_observation_stride() -> int:
-    value = int(os.environ.get("OPENPI_UMI_OBSERVATION_STRIDE", "3"))
-    if value < 1:
-        raise ValueError("OPENPI_UMI_OBSERVATION_STRIDE must be positive")
-    return value
+    return robotwin_umi_config.observation_stride()
 
 
 def _robotwin_umi_observation_steps() -> int:
-    value = int(os.environ.get("OPENPI_UMI_OBSERVATION_STEPS", "2"))
-    if value < 1:
-        raise ValueError("OPENPI_UMI_OBSERVATION_STEPS must be positive")
-    return value
+    return robotwin_umi_config.observation_steps()
 
 
 def _robotwin_umi_asset_id() -> str:
