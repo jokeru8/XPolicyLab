@@ -162,9 +162,16 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             state[meta["key"]] = s.unsqueeze(1).float()
         for meta in self.action_meta:
             a = self._get_action(meta, lerobot_sample)
+            episode_length = a.shape[0]
             a = sliding_window_with_replication(a, self.action_size)
             action[meta["key"]] = a.float()
-        return {"action": action, "state": state}
+        steps = torch.arange(self.action_size).unsqueeze(0)
+        remaining = (episode_length - torch.arange(episode_length)).unsqueeze(1)
+        return {
+            "action": action,
+            "state": state,
+            "action_is_pad": steps >= remaining,
+        }
 
     def _set_return_images(self, flag: bool):
         self.return_images = flag

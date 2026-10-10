@@ -622,7 +622,10 @@ def read_episode(src_hdf5: Path):
     return instruction, fps, num_frames, arrays, frames_by_cam
 
 
-def build_trajectory(job: Job, dst_root: Path, instruction, num_frames, arrays, reframe_p):
+def build_trajectory(
+    job: Job, dst_root: Path, instruction, num_frames, arrays, reframe_p,
+    action_protocol="legacy_ee",
+):
     """Assemble the JSON payload for one episode."""
     left_pos, left_rotm = build_ee_arrays(arrays["left_pose"], reframe_p)
     right_pos, right_rotm = build_ee_arrays(arrays["right_pose"], reframe_p)
@@ -693,21 +696,27 @@ def build_trajectory(job: Job, dst_root: Path, instruction, num_frames, arrays, 
         "trajectory_type": "success",
         "time": datetime.now().strftime("%Y-%m-%d_%H_%M_%S"),
         "num_frames": num_frames,
-        "instruction": {"general": build_general_prompt(normalize_instruction(instruction))},
+        "action_protocol": action_protocol,
+        "instruction": {
+            "text": normalize_instruction(instruction),
+            "general": build_general_prompt(normalize_instruction(instruction)),
+        },
         "observations": observations,
         "proprios": proprios,
         "actions": actions,
     }
 
 
-def convert_one(job: Job, dst_root: Path, fps_override, reframe_p):
+def convert_one(job: Job, dst_root: Path, fps_override, reframe_p, action_protocol):
     """Convert a single episode. Returns (global_index, num_frames, error)."""
     try:
         instruction, fps, num_frames, arrays, frames_by_cam = read_episode(job.src_hdf5)
         if fps_override:
             fps = float(fps_override)
 
-        traj = build_trajectory(job, dst_root, instruction, num_frames, arrays, reframe_p)
+        traj = build_trajectory(
+            job, dst_root, instruction, num_frames, arrays, reframe_p, action_protocol
+        )
 
         for cam_key, _ in CAM_MAP:
             write_video(frames_by_cam[cam_key], job.dst_video(dst_root, cam_key), fps)
@@ -740,7 +749,7 @@ def convert_one(job: Job, dst_root: Path, fps_override, reframe_p):
 # tail-padded frames never enter the statistics. Everything runs in float64.
 
 
-def episode_action_deltas(traj, action_length: int):
+def episode_action_deltas(traj, action_length: int, action_protocol="legacy_ee"):
     """Packed relative action deltas for the whole frames of one episode.
 
     Returns an (n, action_length, 60) array where n counts only frames with a
@@ -792,10 +801,15 @@ def episode_action_deltas(traj, action_length: int):
             packed[:, parts[f"{side}_ee_aa"]] = rotm2aa_batch(
                 rotm.T @ target_rotms[side][frame:stop]
             )
-            packed[:, parts[f"{side}_gripper"]] = (
-                targets[f"{side}_gripper_pos"][frame:stop]
-                - arrays[f"{side}_gripper_pos"][frame]
-            )
+            if action_protocol == "umi_v1":
+                packed[:, parts[f"{side}_gripper"]] = targets[
+                    f"{side}_gripper_pos"
+                ][frame:stop]
+            else:
+                packed[:, parts[f"{side}_gripper"]] = (
+                    targets[f"{side}_gripper_pos"][frame:stop]
+                    - arrays[f"{side}_gripper_pos"][frame]
+                )
 
         packed[:, parts["waist"]] = (
             targets["waist_pos"][frame:stop] - arrays["waist_pos"][frame]
@@ -834,12 +848,12 @@ def episode_state_matrix(traj, action_length: int):
     return state[:keep]
 
 
-def stats_worker(json_path: str, action_length: int):
+def stats_worker(json_path: str, action_length: int, action_protocol="legacy_ee"):
     """Per-episode samples for the statistics pass, run in a worker process."""
     try:
         with open(json_path, "r") as handle:
             traj = json.load(handle)
-        actions = episode_action_deltas(traj, action_length)
+        actions = episode_action_deltas(traj, action_length, action_protocol)
         state = episode_state_matrix(traj, action_length)
         return actions, state, None
     except Exception as exc:
@@ -872,7 +886,7 @@ def step_gaussian(samples, columns):
     return mean, std, report
 
 
-def compute_stats(json_files, action_length: int, workers: int):
+def compute_stats(json_files, action_length: int, workers: int, action_protocol="legacy_ee"):
     """Normalization statistics, following scripts/compute_robodojo_stats.py."""
     action_chunks = []
     state_chunks = []
@@ -886,7 +900,8 @@ def compute_stats(json_files, action_length: int, workers: int):
     frames = 0
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(stats_worker, path, action_length): path for path in json_files
+            pool.submit(stats_worker, path, action_length, action_protocol): path
+            for path in json_files
         }
         with tqdm(total=len(futures), desc="stats", unit="ep", smoothing=0.05) as bar:
             for future in as_completed(futures):
@@ -942,8 +957,13 @@ def compute_stats(json_files, action_length: int, workers: int):
     #    travel maps onto [-1, 1]. See the GRIPPER_ACTION_* notes above for why
     #    this is 0 / GRIPPER_MAX rather than the reference script's 0.5 / 0.5.
     for name in GRIPPER_ACTION_PARTS:
-        mean[:, parts[name]] = GRIPPER_ACTION_MEAN
-        std[:, parts[name]] = GRIPPER_ACTION_STD
+        if action_protocol == "umi_v1":
+            values = actions[:, :, parts[name]].reshape(-1)
+            mean[:, parts[name]] = values.mean()
+            std[:, parts[name]] = max(values.std(), MIN_STD)
+        else:
+            mean[:, parts[name]] = GRIPPER_ACTION_MEAN
+            std[:, parts[name]] = GRIPPER_ACTION_STD
     print(
         f"[process_data]   gripper action: hard-coded mean = {GRIPPER_ACTION_MEAN}, "
         f"std = {GRIPPER_ACTION_STD} (delta convention)",
@@ -952,6 +972,9 @@ def compute_stats(json_files, action_length: int, workers: int):
 
     q01 = np.zeros((1, STATE_DIM), dtype=np.float64)
     q99 = np.zeros((1, STATE_DIM), dtype=np.float64)
+    if action_protocol == "umi_v1":
+        print("[process_data]   state: fixed zero placeholder (camera-only UMI)", flush=True)
+        return mean, std, q01, q99
 
     # 3. gripper state: hard-coded quantiles over the measured travel.
     for name in GRIPPER_STATE_SLICES:
@@ -1006,6 +1029,8 @@ def write_data_config(
     q99,
     action_length: int,
     batch_size: int,
+    action_protocol: str = "legacy_ee",
+    use_head_camera: bool = True,
 ):
     """Emit a hydra data config wired to the converted dataset."""
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1030,6 +1055,9 @@ data:
     train_datasets:
       batch_size: {batch_size}
       action_length: {action_length}
+      action_protocol: {action_protocol}
+      use_head_camera: {str(use_head_camera).lower()}
+      use_proprioception: false
       paths:
 {paths_block}
       mean:
@@ -1097,6 +1125,10 @@ def parse_args(argv=None):
         "--action-length", type=int, default=30,
         help="action chunk length the statistics are computed for (default: 30)",
     )
+    parser.add_argument(
+        "--action-protocol", choices=("legacy_ee", "umi_v1"), default="legacy_ee",
+    )
+    parser.add_argument("--use-head-camera", action="store_true")
     parser.add_argument(
         "--batch-size", type=int, default=16,
         help="batch_size written into the generated data config (default: 16)",
@@ -1181,13 +1213,20 @@ def run_conversion(args, src_root: Path, dst_root: Path, workers: int):
         return planned
 
     fps_override = args.fps if args.fps > 0 else None
-    reframe_p = eef_reframe_p(args.bench_name, args.env_cfg_type)
+    reframe_p = (
+        np.eye(3, dtype=np.float64)
+        if args.action_protocol == "umi_v1"
+        else eef_reframe_p(args.bench_name, args.env_cfg_type)
+    )
     failures = []
     total_frames = 0
 
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = [
-            pool.submit(convert_one, job, dst_root, fps_override, reframe_p)
+            pool.submit(
+                convert_one, job, dst_root, fps_override, reframe_p,
+                args.action_protocol,
+            )
             for job in jobs
         ]
         with tqdm(total=len(futures), desc="convert", unit="ep", smoothing=0.05) as bar:
@@ -1253,7 +1292,9 @@ def main(argv=None):
     if not json_files:
         raise SystemExit("[process_data] no converted episodes available for statistics")
 
-    mean, std, q01, q99 = compute_stats(json_files, args.action_length, workers)
+    mean, std, q01, q99 = compute_stats(
+        json_files, args.action_length, workers, args.action_protocol
+    )
 
     config_path = CONFIG_DATA_DIR / f"{args.config_name}.yaml"
     # Absolute, so the config does not depend on where training is launched.
@@ -1261,7 +1302,8 @@ def main(argv=None):
 
     write_data_config(
         config_path, [config_data_path], mean, std, q01, q99,
-        args.action_length, args.batch_size,
+        args.action_length, args.batch_size, args.action_protocol,
+        args.use_head_camera,
     )
 
     rel_config = os.path.relpath(config_path, XR1_DIR)

@@ -1,5 +1,4 @@
 import logging
-import os
 import sys
 import time
 import inspect
@@ -155,6 +154,8 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        use_head_camera: bool = True,
+        use_proprioception: bool = True,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -178,6 +179,8 @@ class WorldActionRobotWinPolicy:
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
         self._num_video_frames = int(num_video_frames)
+        self.use_head_camera = bool(use_head_camera)
+        self.use_proprioception = bool(use_proprioception)
 
         self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
@@ -220,11 +223,15 @@ class WorldActionRobotWinPolicy:
 
     def _build_robotwin_image_tensor(self, observation: Dict[str, Any]) -> torch.Tensor:
         obs_data = observation["observation"]
-        head = _resize_rgb(obs_data["head_camera"]["rgb"], (320, 256))
-        left = _resize_rgb(obs_data["left_camera"]["rgb"], (160, 128))
-        right = _resize_rgb(obs_data["right_camera"]["rgb"], (160, 128))
-        bottom = np.concatenate([left, right], axis=1)
-        image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
+        if self.use_head_camera:
+            head = _resize_rgb(obs_data["head_camera"]["rgb"], (320, 256))
+            left = _resize_rgb(obs_data["left_camera"]["rgb"], (160, 128))
+            right = _resize_rgb(obs_data["right_camera"]["rgb"], (160, 128))
+            image = np.concatenate([head, np.concatenate([left, right], axis=1)], axis=0)
+        else:
+            left = _resize_rgb(obs_data["left_camera"]["rgb"], (320, 192))
+            right = _resize_rgb(obs_data["right_camera"]["rgb"], (320, 192))
+            image = np.concatenate([left, right], axis=0)
 
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(
             device=self.model.device,
@@ -235,15 +242,16 @@ class WorldActionRobotWinPolicy:
 
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)
-        state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
-        proprio = self._normalize_state(state_vector)
+        proprio = None
+        if self.use_proprioception:
+            state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
+            proprio = self._normalize_state(state_vector)
 
         prompt = DEFAULT_PROMPT.format(task=instruction)
         infer_kwargs = {
             "prompt": prompt,
             "input_image": image_tensor,
             "action_horizon": self.action_horizon,
-            "proprio": proprio,
             "negative_prompt": self.negative_prompt,
             "text_cfg_scale": self.text_cfg_scale,
             "num_inference_steps": self.num_inference_steps,
@@ -252,6 +260,8 @@ class WorldActionRobotWinPolicy:
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
+        if proprio is not None:
+            infer_kwargs["proprio"] = proprio
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
@@ -387,6 +397,8 @@ def get_model(usr_args: Dict[str, Any]):
         tiled=tiled,
         timing_enabled=timing_enabled,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        use_head_camera=_parse_bool(usr_args.get("use_head_camera", True)),
+        use_proprioception=_parse_bool(usr_args.get("use_proprioception", True)),
     )
     return policy
 

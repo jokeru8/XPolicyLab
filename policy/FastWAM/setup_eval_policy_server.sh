@@ -49,6 +49,9 @@ else
 fi
 weights_dir="${ckpt_dir}/checkpoints/weights"
 dataset_stats_path="${FASTWAM_DATASET_STATS_PATH:-${ckpt_dir}/dataset_stats.json}"
+if [[ "${action_type}" == "umi" && -f "${ckpt_dir}/dataset_stats_umi_chunk.json" ]]; then
+    dataset_stats_path="${FASTWAM_DATASET_STATS_PATH:-${ckpt_dir}/dataset_stats_umi_chunk.json}"
+fi
 
 allow_dummy_policy="${FASTWAM_ALLOW_DUMMY_POLICY:-false}"
 checkpoint_path="${FASTWAM_CHECKPOINT_PATH:-}"

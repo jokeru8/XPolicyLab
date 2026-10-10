@@ -1,6 +1,6 @@
 # Copyright (C) 2026 Xiaomi Corporation.
+import json
 import os
-from typing import Any
 
 from lightning import seed_everything
 from lightning.pytorch.strategies import DeepSpeedStrategy
@@ -57,3 +57,23 @@ def process_save_cfg(cfg: Config) -> None:
     cfg.dump(os.path.join(root_dir, "config.yaml"))
     cfg.dump(os.path.join(root_dir, "config.py"))
     cfg.dump(os.path.join("./assets", "config.py"))
+    data = cfg.data.params.train_datasets
+    if str(data.get("action_protocol", "")) == "umi_v1":
+        manifest = {
+            "protocol": "umi_v1",
+            "state_representation": "umi_current_relative_history_se3_gripper_v1",
+            "storage_action_representation": "umi_relative_se3_gripper_v1",
+            "model_action_representation": "umi_chunk_relative_se3_gripper_v1",
+            "use_head_camera": bool(data.get("use_head_camera", False)),
+            "use_proprioception": bool(data.get("use_proprioception", False)),
+            "observation_steps": 1,
+            "observation_stride": 1,
+            "action_horizon": int(data.get("action_length", 30)),
+            "execute_steps": int(data.get("action_length", 30)),
+            "camera_roles": (["head"] if data.get("use_head_camera", False) else [])
+            + ["left_wrist", "right_wrist"],
+            "action_dim": 14,
+            "first_target_offset": 1,
+        }
+        with open(os.path.join(root_dir, "umi_spec.json"), "w", encoding="utf-8") as file:
+            json.dump(manifest, file, ensure_ascii=True, indent=2)

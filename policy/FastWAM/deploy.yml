@@ -13,7 +13,13 @@ bench_name: null
 task_name: null
 ckpt_name: null
 env_cfg_type: null
-action_type: null
+action_type: umi
+action_protocol: umi_v1
+use_head_camera: false
+use_proprioception: false
+observation_steps: 1
+observation_stride: 1
+execute_steps: 24
 action_dim: null
 seed: null
 
@@ -23,11 +29,11 @@ dataset_stats_path: null
 
 # FastWAM upstream policy hyperparameters.
 sim_cfg_name: sim_robotwin.yaml
-sim_task: robotwin_uncond_3cam_384_1e-4
+sim_task: robotwin_umi
 device: cuda
 mixed_precision: bf16
 # null -> upstream default (num_frames - 1, typically 32 for robotwin).
-action_horizon: null
+action_horizon: 32
 replan_steps: 24
 num_inference_steps: 10
 sigma_shift: null

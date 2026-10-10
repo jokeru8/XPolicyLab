@@ -31,7 +31,18 @@ export DIFFSYNTH_MODEL_BASE_PATH="${FASTWAM_DIR}/checkpoints"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONPATH="${ROOT_DIR}:${FASTWAM_DIR}:${FASTWAM_DIR}/src:${PYTHONPATH:-}"
 
-action_dim=$(bash "${UTILS_DIR}/get_action_dim.sh" "${ROOT_DIR}" "${env_cfg_type}")
+if [[ "${action_type}" == "umi" ]]; then
+    action_dim=14
+    task_config=robotwin_umi
+    use_head_camera=$(python - "${POLICY_DIR}/deploy.yml" <<'PY'
+import sys, yaml
+print(str(bool(yaml.safe_load(open(sys.argv[1]))["use_head_camera"])).lower())
+PY
+)
+else
+    action_dim=$(bash "${UTILS_DIR}/get_action_dim.sh" "${ROOT_DIR}" "${env_cfg_type}")
+    task_config=robotwin_uncond_3cam_384_1e-4
+fi
 # Default dataset_id is the 4-tuple data_key. Set FASTWAM_DATASET_ID to point
 # at a differently named dataset without changing the train.sh argument shape.
 data_key="${bench_name}-${ckpt_name}-${env_cfg_type}-${action_type}"
@@ -61,6 +72,17 @@ if [[ ! -d "${dataset_dir}/meta" ]]; then
     exit 1
 fi
 
+if [[ "${action_type}" == "umi" ]]; then
+    # UMI stats must describe fixed-reference SE(3) chunks. Let FastWAM compute
+    # them after UmiChunkActionTransform when no compatible file is present.
+    umi_stats_path="${converted_root}/dataset_stats_umi_chunk.json"
+    if [[ -f "${umi_stats_path}" ]]; then
+        stats_path="${umi_stats_path}"
+    else
+        stats_path="null"
+    fi
+fi
+
 if [[ ! -f "${action_dit}" ]]; then
     echo "[ERROR] Missing ActionDiT backbone: ${action_dit}"
     echo "Run in the FastWAM policy environment:"
@@ -74,7 +96,7 @@ if [[ ! -d "${text_cache_dir}" || -z "$(find "${text_cache_dir}" -name '*.pt' -p
     echo "Precompute it with the upstream script in the FastWAM policy environment:"
     echo "  cd ${FASTWAM_DIR}"
     echo "  python scripts/precompute_text_embeds.py \\"
-    echo "    task=robotwin_uncond_3cam_384_1e-4 \\"
+    echo "    task=${task_config} \\"
     echo "    data.train.dataset_dirs=[${dataset_dir}] \\"
     echo "    data.val.dataset_dirs=[${dataset_dir}] \\"
     echo "    data.train.text_embedding_cache_dir=${text_cache_dir} \\"
@@ -85,7 +107,7 @@ fi
 cd "${FASTWAM_DIR}"
 
 train_common=(
-    "task=robotwin_uncond_3cam_384_1e-4"
+    "task=${task_config}"
     "seed=${train_seed}"
     "batch_size=${batch_size}"
     "gradient_accumulation_steps=${gradient_accumulation_steps}"
@@ -95,8 +117,6 @@ train_common=(
     "data.val.dataset_dirs=[${dataset_dir}]"
     "data.train.text_embedding_cache_dir=${text_cache_dir}"
     "data.val.text_embedding_cache_dir=${text_cache_dir}"
-    "data.train.pretrained_norm_stats=${stats_path}"
-    "data.val.pretrained_norm_stats=${stats_path}"
     "data.train.shape_meta.action.0.raw_shape=${action_dim}"
     "data.train.shape_meta.action.0.shape=${action_dim}"
     "data.train.shape_meta.state.0.raw_shape=${action_dim}"
@@ -106,10 +126,48 @@ train_common=(
     "data.val.shape_meta.state.0.raw_shape=${action_dim}"
     "data.val.shape_meta.state.0.shape=${action_dim}"
     "data.train.processor.action_output_dim=${action_dim}"
-    "data.train.processor.proprio_output_dim=${action_dim}"
     "data.val.processor.action_output_dim=${action_dim}"
-    "data.val.processor.proprio_output_dim=${action_dim}"
     "output_dir=${POLICY_DIR}/checkpoints/${ckpt_setting}"
 )
 
+if [[ "${stats_path}" != "null" ]]; then
+    train_common+=(
+        "data.train.pretrained_norm_stats=${stats_path}"
+        "data.val.pretrained_norm_stats=${stats_path}"
+    )
+else
+    train_common+=(
+        "data.train.pretrained_norm_stats=null"
+        "data.val.pretrained_norm_stats=null"
+    )
+fi
+
+if [[ "${action_type}" == "umi" ]]; then
+    camera_roles='[left_wrist,right_wrist]'
+    if [[ "${use_head_camera}" == "true" ]]; then
+        camera_roles='[head,left_wrist,right_wrist]'
+    fi
+    train_common+=(
+        "model.proprio_dim=null"
+        "data.train.processor.proprio_output_dim=null"
+        "data.val.processor.proprio_output_dim=null"
+        "data.train.processor.use_head_camera=${use_head_camera}"
+        "data.val.processor.use_head_camera=${use_head_camera}"
+        "umi_spec.use_head_camera=${use_head_camera}"
+        "umi_spec.camera_roles=${camera_roles}"
+    )
+else
+    train_common+=(
+        "data.train.processor.proprio_output_dim=${action_dim}"
+        "data.val.processor.proprio_output_dim=${action_dim}"
+    )
+fi
+
 bash scripts/train_zero1.sh "${num_gpus}" "${train_common[@]}"
+
+if [[ "${action_type}" == "umi" ]]; then
+    generated_stats="${POLICY_DIR}/checkpoints/${ckpt_setting}/dataset_stats.json"
+    if [[ -f "${generated_stats}" ]]; then
+        cp "${generated_stats}" "${converted_root}/dataset_stats_umi_chunk.json"
+    fi
+fi

@@ -123,13 +123,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
             action_is_pad = sample["action_is_pad"]
             image_is_pad = sample["image_is_pad"]
-            proprio_is_pad = sample["proprio_is_pad"]
+            proprio_is_pad = sample.get("proprio_is_pad")
             has_pad = False
             if bool(action_is_pad.any().item()):
                 has_pad = True
             if bool(image_is_pad.any().item()):
                 has_pad = True
-            if bool(proprio_is_pad.any().item()):
+            if proprio_is_pad is not None and bool(proprio_is_pad.any().item()):
                 has_pad = True
 
             if not has_pad or attempt >= self.max_padding_retry:
@@ -151,31 +151,39 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         image_is_pad = image_is_pad[self.video_sample_indices]
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
-        if self.concat_multi_camera == "robotwin":
-            if num_cameras != 3:
+        if self.concat_multi_camera in {"robotwin", "robotwin_umi"}:
+            if self.concat_multi_camera == "robotwin" and num_cameras != 3:
                 raise ValueError(
                     f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"
                 )
-            cam_top = transforms_F.resize(
-                video[0],
-                size=[256, 320],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 256, 320]
-            cam_left = transforms_F.resize(
-                video[1],
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 128, 160]
-            cam_right = transforms_F.resize(
-                video[2],
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 128, 160]
-            bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
-            video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
+            if num_cameras == 3:
+                cam_top = transforms_F.resize(
+                    video[0], size=[256, 320],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR, antialias=True,
+                )
+                cam_left = transforms_F.resize(
+                    video[1], size=[128, 160],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR, antialias=True,
+                )
+                cam_right = transforms_F.resize(
+                    video[2], size=[128, 160],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR, antialias=True,
+                )
+                video = torch.cat([cam_top, torch.cat([cam_left, cam_right], dim=-1)], dim=-2)
+            elif self.concat_multi_camera == "robotwin_umi" and num_cameras == 2:
+                wrists = [
+                    transforms_F.resize(
+                        video[index], size=[192, 320],
+                        interpolation=transforms_F.InterpolationMode.BILINEAR, antialias=True,
+                    )
+                    for index in range(2)
+                ]
+                video = torch.cat(wrists, dim=-2)
+            else:
+                raise ValueError(
+                    "`concat_multi_camera='robotwin_umi'` requires 2 wrist cameras "
+                    f"or head+2 wrist cameras, got {num_cameras}"
+                )
         elif num_cameras > 1:
             if self.concat_multi_camera == "horizontal":
                 video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
@@ -200,7 +208,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         #   action: [num_frames-1, action_dim] # start from t0, except the last frame
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
         action = sample["action"] # [T-1, action_dim]
-        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
+        proprio = (
+            sample["proprio"][:-1, :] if "proprio" in sample else None
+        ) # [T-1, state_dim], to align with action
         if video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
         if action.shape[0] % (video.shape[1] - 1) != 0:
@@ -223,14 +233,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         data = {
             "video": video,
             "action": action,
-            "proprio": proprio,
             "prompt": instruction,
             "context": context,
             "context_mask": context_mask,
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
-            "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if proprio is not None:
+            data["proprio"] = proprio
+            data["proprio_is_pad"] = sample["proprio_is_pad"]
         return data
 
     def _get_cached_text_context(self, prompt: str):

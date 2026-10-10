@@ -2,7 +2,7 @@
 
 **Contributor:** Xiaomi Corporation | **Paper:** Not released | **arXiv:** Not released | **Original code:** See vendored `xiaomi_robotics_1/`.
 
-`Xiaomi_Robotics_1` is the adapter for Xiaomi's MiBot model: it drives a trained checkpoint in-process through a Qwen3-VL-4B-Instruct processor and converts the model's relative (delta) action chunks into absolute RoboDojo end-effector actions. It reproduces the official `mibot/server/deploy.py` + `runtime/server.py` + `runtime/client.py` pipeline without the socket hop. Integration scripts live at this directory level; the vendored upstream implementation lives in `xiaomi_robotics_1/xr1/`.
+`Xiaomi_Robotics_1` drives MiBot in-process. Its default XPolicyLab path now uses the Pi0.5-compatible camera-only UMI protocol: wrist or head+wrist images in, fixed-reference 14-D relative SE(3)+absolute-gripper chunks out.
 
 Shared conventions — argument meanings, checkpoint naming, split-machine deployment, `EVAL_ENV_TYPE` — are documented in the [XPolicyLab README](../../README.md). Official results: [RoboDojo LeaderBoard](https://robodojo-benchmark.com/LeaderBoard).
 
@@ -89,7 +89,7 @@ MAX_STEPS=60000 bash train.sh RoboDojo all arx_x5 ee 0 0,1,2,3 \
   trainer.accumulate_grad_batches=2
 ```
 
-The first six arguments follow the shared convention; anything after them is forwarded verbatim to Hydra. `bench_name`, `ckpt_name`, `env_cfg_type`, and `action_type` must match the `process_data.sh` call — they resolve the converted dataset and the generated data config. `action_type` must be `ee` (`ALLOW_NON_EE_ACTION=1` overrides the check; see Notes).
+The first six arguments follow the shared convention; anything after them is forwarded verbatim to Hydra. `bench_name`, `ckpt_name`, `env_cfg_type`, and `action_type` must match the `process_data.sh` call. Supported values are `umi` and the legacy `ee` path.
 
 The converted pretrained weights from [Model Assets](#model-assets) must exist at `checkpoints/pretrained_ckpt/model_states.pt`, or `PRETRAINED_PATH` must point at them.
 
@@ -108,7 +108,6 @@ Logging goes through W&B. `train.sh` defaults to `WANDB_MODE=offline` because th
 | `ASYNC_TRAIN` | Random action-prefix conditioning for asynchronous inference; default `true`. |
 | `MAX_LENGTH` | Per-sample token budget of the collate; default `20000`. |
 | `WANDB_MODE` | `offline` by default; `online` uploads after `wandb login`. |
-| `ALLOW_NON_EE_ACTION` | Set to `1` to train with `action_type != ee` anyway. |
 
 ## Evaluation
 
@@ -132,7 +131,10 @@ bash eval.sh RoboDojo stack_bowls RoboDojo-all-arx_x5-ee-0 arx_x5 ee 0 0 0 <poli
 
 | Key | Meaning |
 | --- | --- |
-| `action_type` | Must be `ee`. `joint` is rejected at startup — see Notes. |
+| `action_type` | `umi` (recommended) or legacy `ee`; `joint` is rejected. |
+| `use_head_camera` | `false`: wrists only; `true`: head plus wrists. Must match training. |
+| `use_proprioception` | Must remain `false` for UMI. XR1 receives an internal zero state placeholder. |
+| `action_horizon`, `execute_steps` | Predicted horizon and leading targets returned to the evaluator. |
 | `model_dir` | Checkpoint dir holding `config.py` and `last.ckpt/`. Overrides `ckpt_name`. |
 | `ckpt_name` | Used when `model_dir` is unset: resolves to `checkpoints/<ckpt_name>/`. Nested layouts are searched for `config.py`. |
 | `action_length` | Leading steps of each chunk to execute; `0` executes the whole chunk, whose length comes from the checkpoint. |
@@ -155,11 +157,11 @@ Script environment variables, all optional:
 | `RUN_ROOT`, `PROJECT` | `train.sh` | Training output root and project segment of the artifact path. |
 | `MAX_STEPS`, `SAVE_INTERVAL`, `ASYNC_TRAIN`, `MAX_LENGTH` | `train.sh` | Training knobs; see the Training section. |
 | `WANDB_MODE` | `train.sh` | `offline` by default. |
-| `ALLOW_NON_EE_ACTION` | `train.sh` | Set to `1` to train with `action_type != ee`. |
 
 ## Notes
 
-- **Only `action_type=ee` is supported.** The packed 60-dim action carries end-effector slots only (`ACTION_PARTS` in `mibot/utils/io.py` has no arm-joint entry), so joint targets cannot be recovered from the model output. Passing `joint` raises at startup rather than emitting wrong actions.
+- `action_type=umi` uses exactly the Pi0.5 external protocol. XR1's required 60-D state tensor is all-zero and is not populated from the robot. Its 60-D action head is an internal carrier; slots `[0:7]` and `[8:15]` map losslessly to the external 14-D UMI action.
+- UMI training uses request-time EEF poses as the fixed chunk reference and absolute gripper targets. It does not restore absolute EEF poses at inference.
 - The input state is always joint-space. State and action use different 60-dim layouts, so they must not be confused:
   - state (`compose_state`): `[0:7]` left_arm_joint, `[7:8]` left_gripper, `[8:15]` right_arm_joint, `[15:16]` right_gripper.
   - action (`ACTION_PARTS`): `[0:3]` left_ee_pos, `[3:6]` left_ee_aa, `[6:7]` left_gripper, `[8:11]` right_ee_pos, `[11:14]` right_ee_aa, `[14:15]` right_gripper, `[16:17]` waist, `[17:20]` base_vel.

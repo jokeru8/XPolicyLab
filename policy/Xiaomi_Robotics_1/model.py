@@ -19,8 +19,8 @@ Model loading mirrors ``mibot.server.deploy``:
     cfg, model = load_model(model_dir, device)
     mean, std, q01, q99, action_mask = load_stats(cfg, device)
 
-Batch assembly mirrors ``mibot.server.runtime.client.Client.__call__``:
-  three PIL views (ego / left-wrist / right-wrist) resized with
+Batch assembly supports two or three PIL views (left/right wrist, optionally
+ego) resized with
   ``mibot.utils.io.resize_image`` and tokenized through the Qwen3-VL chat
   template with ``do_resize=False``, plus a packed 60-dim state.
 
@@ -37,8 +37,8 @@ Vector layouts (from ``mibot/utils/io.py``; note state and action differ):
     [8:11] right_ee_pos, [11:14] right_ee_aa, [14:15] right_gripper,
     [16:17] waist, [17:20] base_vel; every other slot is padding.
 
-Only ``action_type="ee"`` is supported: the packed action carries no arm-joint
-slots, so joint targets cannot be recovered from the model output.
+``action_type="umi"`` exposes the shared 14-D fixed-reference UMI chunk while
+retaining ``ee`` for legacy checkpoints. Joint targets are not supported.
 """
 
 from __future__ import annotations
@@ -53,6 +53,12 @@ from PIL import Image
 from scipy.spatial.transform import Rotation
 
 from XPolicyLab.model_template import ModelTemplate
+from XPolicyLab.utils.umi_protocol import (
+    UMI_BIMANUAL_ACTION_DIM,
+    UmiProtocolSpec,
+    chunk_targets_to_action_dicts,
+    validate_umi_spec,
+)
 
 _SUPPORTED_BENCH_NAMES = ("RoboDojo", "RoboDojo_real")
 
@@ -192,7 +198,8 @@ class Model(ModelTemplate):
     def __init__(self, model_cfg: dict[str, Any]):
         self.model_cfg = model_cfg
         self.action_type = model_cfg.get("action_type", "ee")
-        if self.action_type != "ee":
+        self._is_umi = self.action_type in {"umi", "umi_relative", "relative_ee"}
+        if self.action_type != "ee" and not self._is_umi:
             raise ValueError(
                 f"[Xiaomi_Robotics_1] Unsupported action_type: {self.action_type!r}. "
                 "The packed 60-dim action of this model carries end-effector "
@@ -200,9 +207,16 @@ class Model(ModelTemplate):
                 "targets cannot be recovered from its output. Set "
                 "action_type='ee' in deploy.yml."
             )
-        self.env_cfg_type = model_cfg["env_cfg_type"]
-        self.bench_name = model_cfg["bench_name"]
-        self._eef_reframe_p = _get_eef_reframe_p(self.bench_name, self.env_cfg_type)
+        self.umi_spec = (
+            UmiProtocolSpec.from_mapping(model_cfg) if self._is_umi else None
+        )
+        if self.umi_spec is not None and self.umi_spec.use_proprioception:
+            raise ValueError("Xiaomi UMI requires use_proprioception=false")
+        self.env_cfg_type = model_cfg.get("env_cfg_type")
+        self.bench_name = model_cfg.get("bench_name")
+        self._eef_reframe_p = (
+            np.eye(3) if self._is_umi else _get_eef_reframe_p(self.bench_name, self.env_cfg_type)
+        )
         self._eef_reframe_p_inv = self._eef_reframe_p.T
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -214,7 +228,9 @@ class Model(ModelTemplate):
         self.image_max_pixels = int(model_cfg.get("image_max_pixels", 160000))
         # Number of leading action steps actually executed per inference call;
         # 0 or None means the whole predicted chunk.
-        self.action_length = model_cfg.get("action_length") or 0
+        self.action_length = (
+            self.umi_spec.execute_steps if self.umi_spec else model_cfg.get("action_length") or 0
+        )
 
         xr1_root = _add_xr1_to_path()
         print(f"[Xiaomi_Robotics_1] xr1 package root: {xr1_root}", flush=True)
@@ -235,6 +251,13 @@ class Model(ModelTemplate):
         )
         # (action_length, 60): the chunk shape the DiT head was trained to emit.
         self.action_shape = tuple(self.mean.shape)
+        if self.umi_spec is not None and self.action_shape[0] != self.umi_spec.action_horizon:
+            raise ValueError(
+                "Xiaomi UMI checkpoint/config horizon mismatch: "
+                f"checkpoint={self.action_shape[0]}, requested={self.umi_spec.action_horizon}"
+            )
+        if self.umi_spec is not None:
+            validate_umi_spec(os.path.join(model_dir, "umi_spec.json"), self.umi_spec)
         self._state_valid = self.q99 > self.q01
 
         self.processor = self._build_processor(model_cfg)
@@ -351,26 +374,32 @@ class Model(ModelTemplate):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _messages(instruction, ego_obs, left_wrist_obs, right_wrist_obs):
-        """Chat turns, byte-for-byte identical to mibot Client._messages."""
+    def _messages(instruction, left_wrist_obs, right_wrist_obs, ego_obs=None):
+        """Build the two- or three-view chat prompt used for training/inference."""
+        content = [{
+            "type": "text",
+            "text": "The following observations are captured from multiple views.\n",
+        }]
+        if ego_obs is not None:
+            content.extend([
+                {"type": "text", "text": "# Ego View\n"},
+                {"type": "image", "image": ego_obs},
+                {"type": "text", "text": "\n"},
+            ])
+        content.extend([
+            {"type": "text", "text": "# Left-Wrist View\n"},
+            {"type": "image", "image": left_wrist_obs},
+            {"type": "text", "text": "\n# Right-Wrist View\n"},
+            {"type": "image", "image": right_wrist_obs},
+            {
+                "type": "text",
+                "text": f"\nGenerate robot actions for the task:\n{instruction} /no_cot",
+            },
+        ])
         return [
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "The following observations are captured from multiple views.\n# Ego View\n",
-                    },
-                    {"type": "image", "image": ego_obs},
-                    {"type": "text", "text": "\n# Left-Wrist View\n"},
-                    {"type": "image", "image": left_wrist_obs},
-                    {"type": "text", "text": "\n# Right-Wrist View\n"},
-                    {"type": "image", "image": right_wrist_obs},
-                    {
-                        "type": "text",
-                        "text": f"\nGenerate robot actions for the task:\n{instruction} /no_cot",
-                    },
-                ],
+                "content": content,
             },
             {"role": "assistant", "content": [{"type": "text", "text": "<cot></cot>"}]},
         ]
@@ -383,7 +412,6 @@ class Model(ModelTemplate):
         """
         from mibot.utils.io import resize_image
 
-        head_img = _extract_image(obs, ["cam_head", "cam_high", "head_camera"])
         left_img = _extract_image(obs, ["cam_left_wrist", "left_camera", "wrist_left"])
         right_img = _extract_image(
             obs, ["cam_right_wrist", "right_camera", "wrist_right"]
@@ -392,14 +420,32 @@ class Model(ModelTemplate):
         # Same preprocessing as mibot Client.__call__ and JsonDataset._augment:
         # resize to a factor-of-32 grid under max_pixels, then hand the images
         # to the processor with do_resize disabled.
+        source_images = [left_img, right_img]
+        if self.umi_spec is None or self.umi_spec.use_head_camera:
+            source_images.append(_extract_image(obs, ["cam_head", "cam_high", "head_camera"]))
         pil_images = [
             resize_image(
                 Image.fromarray(img),
                 factor=self.image_factor,
                 max_pixels=self.image_max_pixels,
             )
-            for img in (head_img, left_img, right_img)
+            for img in source_images
         ]
+
+        instruction = self._get_instruction(obs)
+        messages = self._messages(
+            instruction,
+            pil_images[0],
+            pil_images[1],
+            pil_images[2] if len(pil_images) == 3 else None,
+        )
+        if self._is_umi:
+            return {
+                "messages": messages,
+                # XR1 structurally requires a state token. Camera-only UMI uses
+                # a deterministic zero placeholder and never reads robot state.
+                "state": torch.zeros((1, 1, 60), dtype=torch.float32),
+            }
 
         state = obs.get("state", {})
         left_arm_joint = np.asarray(
@@ -444,8 +490,6 @@ class Model(ModelTemplate):
             "right_gripper": float(right_gripper[0]),
         }
 
-        instruction = self._get_instruction(obs)
-
         # Vision + instruction turns only, exactly as mibot Client._messages.
         # The training-time "Robot state: <state>" / "<a_i>...<score>" turns are
         # deliberately NOT added: those tokens are embedded by the VLM only when
@@ -454,8 +498,6 @@ class Model(ModelTemplate):
         # is called without state_embeds, so a <state> token would raise
         # "State tokens require state_embeds". The proprioception reaches the
         # model through batch["state"] -> DiT state_projector instead.
-        messages = self._messages(instruction, *pil_images)
-
         return {
             "messages": messages,
             "state": torch.from_numpy(state_np)[None],  # (1, 1, 60)
@@ -584,6 +626,16 @@ class Model(ModelTemplate):
 
         return action_list
 
+    @staticmethod
+    def _raw_actions_to_umi(raw_actions: np.ndarray) -> np.ndarray:
+        raw = np.asarray(raw_actions, dtype=np.float32)
+        if raw.ndim != 2 or raw.shape[1] != 60:
+            raise ValueError(f"Expected Xiaomi actions [T, 60], got {raw.shape}")
+        umi = np.empty((raw.shape[0], UMI_BIMANUAL_ACTION_DIM), dtype=np.float32)
+        umi[:, :7] = raw[:, :7]
+        umi[:, 7:14] = raw[:, 8:15]
+        return umi
+
     def _restore_abs_ee(
         self,
         delta_pos: np.ndarray,
@@ -641,9 +693,12 @@ class Model(ModelTemplate):
             actions = raw_actions[index]
             if 0 < self.action_length < actions.shape[0]:
                 actions = actions[: self.action_length]
-            chunks.append(
-                self._actions_to_xpl_format(actions, encoded_obs["current_state"])
-            )
+            if self._is_umi:
+                chunks.append(chunk_targets_to_action_dicts(self._raw_actions_to_umi(actions)))
+            else:
+                chunks.append(
+                    self._actions_to_xpl_format(actions, encoded_obs["current_state"])
+                )
         return chunks
 
     def reset(self):

@@ -1,4 +1,3 @@
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,6 +10,12 @@ from XPolicyLab.utils.process_data import (
     get_robot_action_dim_info,
     pack_robot_state,
     unpack_robot_state,
+)
+from XPolicyLab.utils.umi_protocol import (
+    UMI_BIMANUAL_ACTION_DIM,
+    UmiProtocolSpec,
+    chunk_targets_to_action_dicts,
+    validate_umi_spec,
 )
 
 
@@ -64,15 +69,21 @@ class Model(ModelTemplate):
     def __init__(self, model_cfg):
         self.model_cfg = dict(model_cfg)
         self.action_type = self.model_cfg["action_type"]
+        self._is_umi = self.action_type in {"umi", "umi_relative", "relative_ee"}
+        self.umi_spec = UmiProtocolSpec.from_mapping(self.model_cfg) if self._is_umi else None
+        if self.umi_spec is not None and self.umi_spec.use_proprioception:
+            raise ValueError("FastWAM UMI currently requires use_proprioception=false")
         self.env_cfg_type = self.model_cfg["env_cfg_type"]
         self.action_horizon = 1
-        self.replan_steps = int(self.model_cfg.get("replan_steps") or 24)
+        self.replan_steps = int(
+            self.umi_spec.execute_steps if self.umi_spec else self.model_cfg.get("replan_steps") or 24
+        )
         self.default_instruction = str(
             self.model_cfg.get("default_instruction")
             or self.model_cfg.get("prompt")
             or "follow the instruction"
         )
-        self.robot_action_dim_info = get_robot_action_dim_info(self.env_cfg_type)
+        self.robot_action_dim_info = None if self._is_umi else get_robot_action_dim_info(self.env_cfg_type)
         self.last_obs = None
         self.last_instruction = self.default_instruction
         self.model = None
@@ -89,6 +100,11 @@ class Model(ModelTemplate):
             raise FileNotFoundError("FastWAM requires checkpoint_path/ckpt_setting for real deployment.")
         if _is_none_like(dataset_stats_path):
             raise FileNotFoundError("FastWAM requires dataset_stats_path for real deployment.")
+        if self.umi_spec is not None:
+            validate_umi_spec(
+                Path(checkpoint_path).expanduser().resolve().parent / "umi_spec.json",
+                self.umi_spec,
+            )
 
         for path in (str(FASTWAM_ROOT), str(FASTWAM_SRC)):
             if path not in sys.path:
@@ -99,30 +115,43 @@ class Model(ModelTemplate):
         upstream_cfg = dict(self.model_cfg)
         upstream_cfg["ckpt_setting"] = str(Path(checkpoint_path).expanduser().resolve())
         upstream_cfg["dataset_stats_path"] = str(Path(dataset_stats_path).expanduser().resolve())
+        if self.umi_spec is not None:
+            upstream_cfg.update(self.umi_spec.to_dict())
+            upstream_cfg["sim_task"] = str(self.model_cfg.get("sim_task") or "robotwin_umi")
+            upstream_cfg["replan_steps"] = self.umi_spec.execute_steps
         upstream_cfg.setdefault("sim_cfg_name", "sim_robotwin.yaml")
         upstream_cfg.setdefault("sim_task", "robotwin_uncond_3cam_384_1e-4")
         self.model = get_model(upstream_cfg)
         self.action_horizon = int(self.model.action_horizon)
         self.replan_steps = int(self.model.replan_steps)
+        if self.umi_spec is not None and self.action_horizon != self.umi_spec.action_horizon:
+            raise ValueError(
+                "FastWAM UMI checkpoint/config horizon mismatch: "
+                f"model={self.action_horizon}, requested={self.umi_spec.action_horizon}"
+            )
 
     def _encode_obs_for_fastwam(self, obs: dict) -> dict:
         vision = obs["vision"]
-        adapted = {
-            "observation": {
+        cameras = {
+            "left_camera": {"rgb": _standardize_rgb(vision["cam_left_wrist"]["color"])},
+            "right_camera": {"rgb": _standardize_rgb(vision["cam_right_wrist"]["color"])},
+        }
+        if self.umi_spec is None or self.umi_spec.use_head_camera:
+            cameras = {
                 "head_camera": {"rgb": _standardize_rgb(vision["cam_head"]["color"])},
-                "left_camera": {"rgb": _standardize_rgb(vision["cam_left_wrist"]["color"])},
-                "right_camera": {"rgb": _standardize_rgb(vision["cam_right_wrist"]["color"])},
-            },
-            "joint_action": {
+                **cameras,
+            }
+        adapted = {"observation": cameras}
+        if not self._is_umi:
+            adapted["joint_action"] = {
                 "vector": pack_robot_state(
                     obs,
                     self.action_type,
                     self.robot_action_dim_info,
                     source_type="obs",
                     state_type="state",
-                ).astype(np.float32)
-            },
-        }
+                ).astype(np.float32),
+            }
         return adapted
 
     def update_obs(self, obs):
@@ -140,6 +169,9 @@ class Model(ModelTemplate):
             self._batch_instruction[env_idx] = _get_instruction(obs, self.default_instruction)
 
     def _zero_actions(self):
+        if self._is_umi:
+            zeros = np.zeros((self.replan_steps, UMI_BIMANUAL_ACTION_DIM), dtype=np.float32)
+            return chunk_targets_to_action_dicts(zeros)
         dim = sum(self.robot_action_dim_info["arm_dim"]) + sum(self.robot_action_dim_info["ee_dim"])
         zeros = np.zeros((self.replan_steps, dim), dtype=np.float32)
         return unpack_robot_state(zeros, self.action_type, self.robot_action_dim_info, source_type="obs")
@@ -153,6 +185,13 @@ class Model(ModelTemplate):
         action_chunk = np.asarray(action_chunk, dtype=np.float32)
         if action_chunk.ndim == 1:
             action_chunk = action_chunk[None, :]
+        if self._is_umi:
+            expected = (self.umi_spec.action_horizon, UMI_BIMANUAL_ACTION_DIM)
+            if action_chunk.shape != expected:
+                raise ValueError(
+                    f"FastWAM UMI output must have shape {expected}, got {action_chunk.shape}"
+                )
+            return chunk_targets_to_action_dicts(action_chunk[: self.umi_spec.execute_steps])
         n_exec = min(self.replan_steps, action_chunk.shape[0])
         action_chunk = action_chunk[:n_exec]
         return unpack_robot_state(action_chunk, self.action_type, self.robot_action_dim_info, source_type="obs")

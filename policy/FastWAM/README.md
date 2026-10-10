@@ -49,8 +49,16 @@ bash eval.sh RoboDojo stack_bowls RoboDojo-cotrain-arx_x5-joint-0 arx_x5 joint 0
 
 `deploy.yml` keys to check before evaluation: `action_dim`, `checkpoint_path`, `dataset_stats_path`, `sim_cfg_name`, `sim_task`, `device`, `mixed_precision`, `action_horizon`, `replan_steps`, `num_inference_steps`, `sigma_shift`.
 
+For the Pi0.5-compatible camera-only path, use `action_type: umi`. The external
+contract is `umi_v1`: two wrist views by default, optional head view controlled
+only by `use_head_camera`, no proprioception, and 14-D
+`umi_chunk_relative_se3_gripper_v1` output. Training consumes the same LeRobot
+UMI storage actions as Pi0.5 and composes adjacent SE(3) deltas into a fixed-
+reference chunk before normalization. Changing the camera switch requires a
+separately trained checkpoint; `umi_spec.json` prevents accidental mismatch.
+
 Optional policy-specific environment overrides used by the scripts: `FASTWAM_DATASET_ID`, `FASTWAM_BATCH_SIZE`, `FASTWAM_GRADIENT_ACCUMULATION_STEPS`, `FASTWAM_NUM_WORKERS`, `FASTWAM_NUM_EPOCHS`, `FASTWAM_CKPT_SETTING`, `FASTWAM_CKPT_ROOT`, `FASTWAM_CHECKPOINT_PATH`, `FASTWAM_DATASET_STATS_PATH`, `FASTWAM_ALLOW_DUMMY_POLICY`.
 
 ## Notes
 
-- Use the same `action_type` for training and evaluation. The reference FastWAM path follows XPolicyLab's `pack_robot_state` / `unpack_robot_state` helpers directly and does not add policy-local `ee` pose conversion.
+- Use the same `action_type` for training and evaluation. Legacy action types follow `pack_robot_state` / `unpack_robot_state`; UMI bypasses both helpers.

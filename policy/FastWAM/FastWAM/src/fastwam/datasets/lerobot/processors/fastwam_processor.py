@@ -17,9 +17,9 @@ class FastWAMProcessor(BaseProcessor):
         # keys
         shape_meta: Dict[str, Any],
         num_obs_steps: int,
-        num_output_cameras: int, 
+        num_output_cameras: Optional[int],
         action_output_dim: int,
-        proprio_output_dim: int,
+        proprio_output_dim: Optional[int],
 
         action_state_transforms: Optional[List[Any]], 
 
@@ -40,12 +40,14 @@ class FastWAMProcessor(BaseProcessor):
 
         tokenizer: Optional[Any] = None,
         delta_action_dim_mask: Optional[Dict[str, List[bool]]] = None,
+        use_head_camera: Optional[bool] = None,
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
         self.num_output_cameras = num_output_cameras
         self.action_output_dim = action_output_dim
         self.proprio_output_dim = proprio_output_dim
+        self.use_head_camera = use_head_camera
 
         self.drop_high_level_prob = drop_high_level_prob
         self.use_zh_instruction = use_zh_instruction
@@ -147,6 +149,10 @@ class FastWAMProcessor(BaseProcessor):
         return instruction
 
     def action_state_transform(self, batch):
+        if self.proprio_output_dim is None:
+            batch["state"] = {
+                key: torch.zeros_like(value) for key, value in batch["state"].items()
+            }
         if "action" in batch:
             for meta in self.shape_meta["action"]:
                 k, meta_shape = meta["key"], meta["raw_shape"]
@@ -215,6 +221,8 @@ class FastWAMProcessor(BaseProcessor):
         processed_images = []
         for meta in self.shape_meta["images"]:
             key, shape = meta["key"], meta["shape"]
+            if self.use_head_camera is False and key in {"cam_high", "cam_head", "head_camera"}:
+                continue
             image = data["images"][key]  # [num_obs_steps, C, H, W]
             assert image.ndim == 4, f"Expected 4 dimensions (num_obs_steps, C, H, W), got shape {image.shape}"
             
@@ -231,6 +239,17 @@ class FastWAMProcessor(BaseProcessor):
             processed_images.append(image)
         pixel_values = torch.stack(processed_images, dim=0) # [num_input_cameras, T, C, H, W]
         
+        if self.use_head_camera is not None:
+            expected_cameras = 3 if self.use_head_camera else 2
+            if pixel_values.shape[0] != expected_cameras:
+                raise ValueError(
+                    f"UMI camera selection expected {expected_cameras} views, "
+                    f"got {pixel_values.shape[0]}"
+                )
+            if self.num_output_cameras is None:
+                self.num_output_cameras = expected_cameras
+        elif self.num_output_cameras is None:
+            self.num_output_cameras = pixel_values.shape[0]
         if self.num_output_cameras > pixel_values.shape[0]:
             out = torch.zeros((self.num_output_cameras,) + pixel_values.shape[1:], device=pixel_values.device, dtype=pixel_values.dtype)
             out[0: pixel_values.shape[0]] = pixel_values
@@ -270,10 +289,11 @@ class FastWAMProcessor(BaseProcessor):
 
         
         # TODO: rename all "state" into "proprio"
-        sample["proprio"] = data["state"] # [num_obs_steps, proprio_dim]
-        sample["proprio_is_pad"] = data["state_is_pad"] # [num_obs_steps,]
-        sample["proprio_dim_is_pad"] = data["state_dim_is_pad"] # [proprio_dim,]
-        assert sample["proprio"].shape[-1] == self.proprio_output_dim
+        if self.proprio_output_dim is not None:
+            sample["proprio"] = data["state"] # [num_obs_steps, proprio_dim]
+            sample["proprio_is_pad"] = data["state_is_pad"] # [num_obs_steps,]
+            sample["proprio_dim_is_pad"] = data["state_dim_is_pad"] # [proprio_dim,]
+            assert sample["proprio"].shape[-1] == self.proprio_output_dim
 
         sample["idx"] = data["idx"]
 

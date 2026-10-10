@@ -568,6 +568,10 @@ class Wan22Trainer:
         model = self.accelerator.unwrap_model(self.model)
         ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
         model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
+        umi_spec = self.cfg.get("umi_spec")
+        if umi_spec is not None:
+            with open(os.path.join(self.weights_dir, "umi_spec.json"), "w", encoding="utf-8") as f:
+                json.dump(dict(umi_spec), f, ensure_ascii=True, indent=2)
         return ckpt_path
 
     def _save_trainer_state(self, state_path: str):

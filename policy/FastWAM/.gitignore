@@ -1,4 +1,6 @@
 data/
+!FastWAM/configs/data/
+!FastWAM/configs/data/robotwin_umi.yaml
 checkpoints/
 FastWAM/checkpoints/
 FastWAM/runs/

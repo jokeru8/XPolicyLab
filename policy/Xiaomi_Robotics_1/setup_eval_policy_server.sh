@@ -26,7 +26,7 @@ CONDA_BASE="$(conda info --base)"
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate "${policy_conda_env}"
 
-export PYTHONPATH="${XR1_ROOT}:${PYTHONPATH:-}"
+export PYTHONPATH="${ROOT_DIR}:${XR1_ROOT}:${PYTHONPATH:-}"
 
 exec env \
     PYTHONWARNINGS=ignore::UserWarning \

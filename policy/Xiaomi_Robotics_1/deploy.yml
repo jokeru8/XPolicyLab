@@ -14,7 +14,14 @@ eval_env: debug
 # Model configuration
 # Only "ee" is supported: the packed 60-dim action carries end-effector slots
 # only (ACTION_PARTS in mibot/utils/io.py), so joint targets cannot be recovered.
-action_type: ee
+action_type: umi
+action_protocol: umi_v1
+use_head_camera: false
+use_proprioception: false
+observation_steps: 1
+observation_stride: 1
+action_horizon: 30
+execute_steps: 30
 model_dir: null
 
 # Number of leading steps of each predicted chunk to execute.

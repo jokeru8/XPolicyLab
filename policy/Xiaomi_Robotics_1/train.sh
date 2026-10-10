@@ -12,7 +12,7 @@
 #                    selects the converted dataset and the generated data
 #                    config, and names the checkpoint directory
 #   env_cfg_type     robot subdirectory the dataset was converted for
-#   action_type      must be ee; the model emits end-effector deltas only
+#   action_type      ee (legacy) or umi (camera-only UMI protocol)
 #   seed             training seed, also part of the checkpoint directory name
 #   gpu_id           comma-separated local GPU ids, e.g. 0 or 0,1,2,3
 #
@@ -28,7 +28,6 @@
 #   ASYNC_TRAIN      model.params.model.async_train (default: true)
 #   MAX_LENGTH       per-sample token budget of the collate (default: 20000)
 #   WANDB_MODE       wandb mode (default: offline; set to online to upload)
-#   ALLOW_NON_EE_ACTION  set to 1 to train with action_type != ee anyway
 #
 # Multi-node: WORLD_SIZE, RANK, MASTER_ADDR, and MASTER_PORT are read by the
 # vendored launcher; gpu_id sets the per-node GPU count.
@@ -65,11 +64,10 @@ esac
 # The packed 60-dim action carries end-effector slots only (ACTION_PARTS in
 # mibot/utils/io.py), so a joint-space run produces a checkpoint model.py
 # rejects at eval startup. Fail here instead of after the training budget.
-if [[ "${action_type}" != "ee" && "${ALLOW_NON_EE_ACTION:-0}" != "1" ]]; then
+if [[ "${action_type}" != "ee" && "${action_type}" != "umi" ]]; then
     echo "[Xiaomi_Robotics_1] action_type='${action_type}' cannot be deployed:" \
          "the model emits end-effector deltas only, and model.py accepts" \
-         "'ee' alone at startup." >&2
-    echo "[Xiaomi_Robotics_1] set ALLOW_NON_EE_ACTION=1 to train anyway." >&2
+         "only 'ee' or 'umi' at startup." >&2
     exit 1
 fi
 

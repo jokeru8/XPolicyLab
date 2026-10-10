@@ -39,6 +39,12 @@ class JsonDataset(Dataset):
     def __init__(self, params):
         data = params["train_datasets"]
         self.action_length = int(data.get("action_length", params.get("action_length", 30)))
+        self.action_protocol = str(data.get("action_protocol", "legacy_ee"))
+        self.umi_mode = self.action_protocol == "umi_v1"
+        self.use_head_camera = bool(data.get("use_head_camera", True))
+        self.use_proprioception = bool(data.get("use_proprioception", True))
+        if self.umi_mode and self.use_proprioception:
+            raise ValueError("Xiaomi UMI training requires use_proprioception=false")
         self.batch_size = int(data.get("batch_size", 16))
         self.max_samples = int(params.get("max_steps", 1000)) * self.batch_size * int(os.environ.get("WORLD_SIZE", 1))
         self.mean, self.std = validate_stats(data["mean"], data["std"], self.action_length)
@@ -64,7 +70,11 @@ class JsonDataset(Dataset):
         base = self._pad(self._future(traj, "actions.base_vel", frame, steps), steps)
         action_parts = normalize_action_parts((*left, *right, waist, base), self.mean, self.std)
         action = compose_action(*action_parts, action_length=self.action_length)
-        state = normalize_quantile(self._state(traj, frame), self.q01, self.q99)
+        state = (
+            np.zeros((1, 60), dtype=np.float32)
+            if self.umi_mode
+            else normalize_quantile(self._state(traj, frame), self.q01, self.q99)
+        )
         action_mask = build_action_mask(self.action_length, self._mask(traj, steps))
         prompt["conversations"] += [
             {"from": "human", "value": "Robot state: <state>"},
@@ -127,11 +137,35 @@ class JsonDataset(Dataset):
         if not prompts:
             raise ValueError(f"trajectory {traj.get('time', '<unknown>')} has no instruction.general")
         prompt = copy.deepcopy(random.choice(prompts))
+        if self.umi_mode:
+            prompt = self._umi_prompt(traj, self.use_head_camera)
         conversations = prompt.get("conversations", [])
         if len(conversations) >= 2:
             conversations[0]["value"] += " /no_cot"
             conversations[1]["value"] = "<cot></cot>"
         return prompt
+
+    @staticmethod
+    def _umi_prompt(traj, use_head_camera):
+        camera_names = (
+            ("ego", "# Ego View\n") if use_head_camera else None,
+            ("wrist_left", "# Left-Wrist View\n"),
+            ("wrist_right", "# Right-Wrist View\n"),
+        )
+        camera_names = [item for item in camera_names if item is not None]
+        instruction = str(
+            traj.get("instruction", {}).get("text", "Perform the task.")
+        ).strip()
+        human = "The following observations are captured from multiple views.\n"
+        human += "".join(f"{heading}<image>\n" for _, heading in camera_names)
+        human += f"Generate robot actions for the task:\n{instruction}"
+        return {
+            "images": [f"observations.{name}" for name, _ in camera_names],
+            "conversations": [
+                {"from": "human", "value": human},
+                {"from": "gpt", "value": ""},
+            ],
+        }
 
     @staticmethod
     def _images(traj, keys, frame):
@@ -228,10 +262,15 @@ class JsonDataset(Dataset):
         pos = self._frame(traj, f"proprios.{arm}_ee_pos", frame)
         target_pos = self._future(traj, f"actions.{arm}_ee_pos", frame, steps)
         target_rotm = self._future(traj, f"actions.{arm}_ee_rotm", frame, steps).reshape(-1, 3, 3)
+        gripper = (
+            self._pad(self._future(traj, f"actions.{arm}_gripper_pos", frame, steps), steps)
+            if self.umi_mode
+            else self._delta(traj, f"proprios.{arm}_gripper_pos", f"actions.{arm}_gripper_pos", frame, steps)
+        )
         return (
             self._pad((rotm.T @ (target_pos - pos).T).T, steps),
             self._pad(rotm2aa_batch(rotm.T @ target_rotm), steps),
-            self._delta(traj, f"proprios.{arm}_gripper_pos", f"actions.{arm}_gripper_pos", frame, steps),
+            gripper,
         )
 
     def _delta(self, traj, current_key, target_key, frame, steps):

@@ -46,3 +46,34 @@ def test_invalid_trajectory_masks_only_real_steps():
 
     np.testing.assert_array_equal(mask[:3], np.ones(3, dtype=np.int32))
     np.testing.assert_array_equal(mask[3:], np.zeros(27, dtype=np.int32))
+
+
+def test_umi_arm_action_uses_fixed_reference_and_absolute_gripper():
+    dataset = JsonDataset.__new__(JsonDataset)
+    dataset.action_length = 2
+    dataset.umi_mode = True
+    eye = np.eye(3, dtype=np.float32).reshape(-1).tolist()
+    traj = {
+        "proprios": {
+            "left_ee_rotm": [eye, eye],
+            "left_ee_pos": [[0, 0, 0], [1, 0, 0]],
+            "left_gripper_pos": [[0.2], [0.3]],
+        },
+        "actions": {
+            "left_ee_rotm": [eye, eye],
+            "left_ee_pos": [[1, 0, 0], [2, 0, 0]],
+            "left_gripper_pos": [[0.4], [0.8]],
+        },
+    }
+    pos, rot, grip = dataset._arm_action(traj, "left", 0, 2)
+    np.testing.assert_allclose(pos[:, 0], [1, 2])
+    np.testing.assert_allclose(rot, 0)
+    np.testing.assert_allclose(grip[:, 0], [0.4, 0.8])
+
+
+def test_umi_prompt_camera_switch():
+    traj = {"instruction": {"text": "move."}}
+    wrist = JsonDataset._umi_prompt(traj, use_head_camera=False)
+    head = JsonDataset._umi_prompt(traj, use_head_camera=True)
+    assert len(wrist["images"]) == 2
+    assert len(head["images"]) == 3

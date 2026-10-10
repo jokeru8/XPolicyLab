@@ -76,9 +76,24 @@ args=(
     --dst "${output_dir}"
     --env-cfg-type "${env_cfg_type}"
     --config-name "${config_name}"
-    --action-length "${ACTION_LENGTH:-30}"
+    --action-length "${ACTION_LENGTH:-$(python - "${POLICY_DIR}/deploy.yml" <<'PY'
+import sys, yaml
+print(int(yaml.safe_load(open(sys.argv[1]))["action_horizon"]))
+PY
+)}"
     --batch-size "${BATCH_SIZE:-16}"
 )
+if [[ "${action_type}" == "umi" ]]; then
+    args+=(--action-protocol umi_v1)
+    use_head_camera=$(python - "${POLICY_DIR}/deploy.yml" <<'PY'
+import sys, yaml
+print(str(bool(yaml.safe_load(open(sys.argv[1]))["use_head_camera"])).lower())
+PY
+)
+    if [[ "${use_head_camera}" == "true" ]]; then
+        args+=(--use-head-camera)
+    fi
+fi
 
 # "all" (or an empty ckpt_name) converts every task; anything else is a filter.
 if [[ -n "${ckpt_name}" && "${ckpt_name}" != "all" ]]; then

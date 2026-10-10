@@ -13,6 +13,8 @@ workers, policy servers, and renderer-free tests.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
+from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
@@ -127,6 +129,47 @@ class UmiProtocolSpec:
                 config.get("action_protocol", config.get("umi_protocol", UMI_PROTOCOL))
             ),
         )
+
+
+_CHECKPOINT_SPEC_KEYS = (
+    "protocol",
+    "storage_action_representation",
+    "model_action_representation",
+    "state_representation",
+    "use_head_camera",
+    "use_proprioception",
+    "observation_steps",
+    "observation_stride",
+    "action_dim",
+    "action_horizon",
+    "first_target_offset",
+)
+
+
+def write_umi_spec(path: str | Path, spec: UmiProtocolSpec) -> Path:
+    """Write the portable UMI checkpoint manifest."""
+    manifest_path = Path(path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(spec.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def validate_umi_spec(path: str | Path, spec: UmiProtocolSpec) -> None:
+    """Reject a checkpoint trained with a different external UMI contract."""
+    manifest_path = Path(path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"UMI checkpoint manifest is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected = spec.to_dict()
+    for key in _CHECKPOINT_SPEC_KEYS:
+        if manifest.get(key) != expected[key]:
+            raise ValueError(
+                f"UMI checkpoint/config mismatch for {key}: "
+                f"checkpoint={manifest.get(key)!r}, requested={expected[key]!r}"
+            )
 
 
 def _as_bool(value: Any, *, name: str) -> bool:
